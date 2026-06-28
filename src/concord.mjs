@@ -176,9 +176,11 @@ async function reapHostAdapter(id) {
   if (!pid) return false;
   const { reaped, reason } = await reapAdapterGroup({ pid, start }, { kill, startOf: procStart });
   // Clear only when the pid is genuinely done with — reaped, already-gone, or PROVEN
-  // recycled. On 'unverifiable' (ps failed / start never captured) keep the pid so a
-  // later sweep can retry once ps recovers; clearing it would permanently orphan a
-  // still-live burner (round-4 finding).
+  // recycled. On 'unverifiable' keep the pid (clearing it would permanently orphan a
+  // still-live burner — round-4 finding). Two sub-cases: a TRANSIENT ps failure at reap
+  // (start was captured) self-heals on a later sweep when ps recovers; but if ps was
+  // absent AT CAPTURE the start is null forever, so this host is never auto-reaped —
+  // only a clean shutdown or a manual kill clears it (the spawn-time warning flags it).
   if (reason !== 'unverifiable') clearAdapter(id);
   return reaped;
 }
