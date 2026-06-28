@@ -33,5 +33,13 @@
     "cli"
   ],
   "author": "Concord",
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zkwasm/concord-agent.git"
+  },
+  "homepage": "https://github.com/zkwasm/concord-agent#readme",
+  "bugs": {
+    "url": "https://github.com/zkwasm/concord-agent/issues"
+  }
 }
