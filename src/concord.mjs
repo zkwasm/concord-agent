@@ -6,16 +6,17 @@
 //   concord host <agent>   join + your own IM bot (personal mode), progress ON
 //   concord list|status|logs|stop|restart|rm|prune    lifecycle
 //
-// Clean reclamation: the agent's ACP adapter is the supervisor's own child group,
-// so `stop` just SIGTERMs the supervisor (→ it kills the group), SIGKILL backstop.
-// No external resident daemon to chase, no orphan token-burn. See reclaim.mjs.
+// Clean reclamation: `stop` reaps BOTH the supervisor and the ACP adapter process
+// GROUP (whose pgid the supervisor records in its state file), confirming the whole
+// tree is dead before reporting success; `prune` sweeps orphaned adapter groups
+// left by a crashed supervisor. No orphan token-burn. See reclaim.mjs.
 import { spawn } from 'node:child_process';
 import { openSync, createReadStream, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveConfig, parseArgs } from './cli.mjs';
 import { openRegistry, newId } from './hosts.mjs';
-import { stopHost } from './reclaim.mjs';
+import { stopHost, reapPid } from './reclaim.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { saveCreds, removeCreds, loadCreds } from './creds.mjs';
 
@@ -143,10 +144,16 @@ function logsHost(id, follow) {
   }
 }
 
+// The supervisor records the ACP adapter's process-group pgid in its state file
+// (so we can reap the group even if the supervisor died without cleanup).
+function readAdapterPid(id) {
+  try { return JSON.parse(readFileSync(reg.statePath(id), 'utf8')).adapterPid ?? null; } catch { return null; }
+}
+
 async function stopHostCmd(id, { silent } = {}) {
   const h = reg.get(id);
   if (!h) { if (!silent) die(`no such host: ${id}`); return; }
-  const { steps } = await stopHost(h, { kill });
+  const { steps } = await stopHost({ ...h, adapterPid: readAdapterPid(id) }, { kill });
   reg.update(id, { pid: null, stopped: true, stoppedAt: Date.now() });
   if (!silent) console.log(`✓ stopped ${id} — reclaim: ${steps.join(' → ') || '(none)'}`);
 }
@@ -154,16 +161,28 @@ async function stopHostCmd(id, { silent } = {}) {
 async function restartHost(id) {
   const h = reg.get(id);
   if (!h) die(`no such host: ${id}`);
-  await stopHostCmd(id, { silent: true });
-  await new Promise((r) => setTimeout(r, 800));   // let the daemon shut down
+  await stopHostCmd(id, { silent: true });   // now waits until the whole tree is dead
   const pid = spawnDaemon(id, { ...h, pid: undefined, stopped: false }, { fg: false });
   reg.update(id, { stopped: false });
   console.log(`✓ restarted ${id} — new pid ${pid}`);
 }
 
 async function prune() {
+  // Crash-path safety: a supervisor that died without running its shutdown handler
+  // leaves its detached ACP adapter group orphaned (reparented to init, still
+  // burning tokens). Reap any such orphan whose supervisor pid is gone but whose
+  // recorded adapter pgid is still alive, BEFORE dropping the dead registry entries.
+  const reaped = [];
+  for (const h of reg.list()) {
+    if (h.alive) continue;                       // supervisor still running → leave it
+    const apid = readAdapterPid(h.id);
+    if (apid && kill(apid, 0)) { await reapPid(apid, { kill, group: true }); reaped.push(h.id); }
+  }
   const dead = reg.pruneDead();
-  console.log(dead.length ? `✓ pruned dead: ${dead.join(', ')}` : 'nothing to prune (no dead entries)');
+  const parts = [];
+  if (reaped.length) parts.push(`reaped orphan agents: ${reaped.join(', ')}`);
+  parts.push(dead.length ? `pruned dead: ${dead.join(', ')}` : 'no dead entries');
+  console.log('✓ ' + parts.join(' · '));
 }
 
 // Clear a budget pause on a running host (SIGUSR1 — the daemon resets its window).

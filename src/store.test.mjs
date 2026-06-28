@@ -20,6 +20,17 @@ test('session id survives reopen (resume across restarts)', () => {
   assert.equal(s2.wasRelayedIn('room1', 'm1'), true);
 });
 
+test('adapter pgid survives reopen (CLI can reap an orphaned group)', () => {
+  const path = freshPath();
+  const s1 = openStore(path);
+  assert.equal(s1.getAdapterPid(), null);
+  s1.setAdapterPid(48213);
+  const s2 = openStore(path);
+  assert.equal(s2.getAdapterPid(), 48213);
+  s2.setAdapterPid(null);                 // cleared on clean shutdown
+  assert.equal(openStore(path).getAdapterPid(), null);
+});
+
 test('dedup: relayedIn / sentOut / processedInbound', () => {
   const s = openStore(freshPath());
   assert.equal(s.wasRelayedIn('r', 'x'), false);

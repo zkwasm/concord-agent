@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as acp from '@agentclientprotocol/sdk';
-import { createEngine, decidePermission, usageOf, adapterFor } from './engine.mjs';
+import { createEngine, decidePermission, usageOf, adapterFor, makeUsageMapper } from './engine.mjs';
 
 // ---- pure helpers ----
 test('decidePermission: approve-all selects an allow option', () => {
@@ -83,15 +83,52 @@ test('engine drives a real ACP turn in-process: reply + usage + progress + auto-
   const engine = createEngine({ agent: 'claude', cwd: '/tmp', permission: 'approve-all', log: () => {}, _agentApp: mockAgent(captured) });
 
   const updates = [];
-  const { reply, usage, stopReason } = await engine.runTurn('please write hello', (u) => updates.push(u));
+  const { reply, usage, stopReason, usagePresent } = await engine.runTurn('please write hello', (u) => updates.push(u));
 
   assert.equal(reply, 'working on it. done.');                 // text chunks accumulated across the turn
   assert.deepEqual(usage, { fresh: 30, cached: 5 });            // ACP usage → our accounting
+  assert.equal(usagePresent, true);
   assert.equal(stopReason, 'end_turn');
   assert.equal(captured.permission.outcome, 'selected');       // engine auto-approved the permission request
   assert.equal(captured.permission.optionId, 'ok');
   const tools = updates.filter((u) => u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update');
   assert.ok(tools.length >= 2, `tool updates surfaced to onUpdate (got ${tools.length})`);
+  assert.equal(engine.dead(), false);                          // healthy after a successful turn
 
-  engine.shutdown();
+  await engine.shutdown();                                     // shutdown is awaitable
+});
+
+// --- usage mapper (per-turn vs cumulative; absent) ---
+test('makeUsageMapper: per-turn takes each turn as-is', () => {
+  const map = makeUsageMapper('per-turn');
+  assert.deepEqual(map({ inputTokens: 10, outputTokens: 20, cachedReadTokens: 5 }), { fresh: 30, cached: 5, present: true });
+  assert.deepEqual(map({ inputTokens: 7, outputTokens: 3, cachedReadTokens: 1 }), { fresh: 10, cached: 1, present: true });
+});
+
+test('makeUsageMapper: cumulative reports per-turn DELTAS (no double counting)', () => {
+  const map = makeUsageMapper('cumulative');
+  // adapter reports running session totals
+  assert.deepEqual(map({ inputTokens: 10, outputTokens: 20, cachedReadTokens: 5 }), { fresh: 30, cached: 5, present: true });
+  assert.deepEqual(map({ inputTokens: 15, outputTokens: 35, cachedReadTokens: 9 }), { fresh: 20, cached: 4, present: true }); // (15+35)-(10+20)=20, 9-5=4
+});
+
+test('makeUsageMapper: absent/empty usage → present:false (budget can warn, not silently no-op)', () => {
+  const map = makeUsageMapper('per-turn');
+  assert.deepEqual(map(undefined), { fresh: 0, cached: 0, present: false });
+  assert.deepEqual(map({}), { fresh: 0, cached: 0, present: false });
+});
+
+// --- resilience: a mid-turn agent failure REJECTS runTurn cleanly (no crash, no
+//     floating unhandled rejection, no wedge) while the connection stays usable.
+//     The bridge's drain() catches the rejection; dead() only flips on a real
+//     connection/adapter death, not a single turn error. ---
+test('engine: a failing turn rejects runTurn cleanly; engine stays usable', async () => {
+  const failing = acp.agent({ name: 'boom' })
+    .onRequest('initialize', () => ({ protocolVersion: acp.PROTOCOL_VERSION, agentCapabilities: { loadSession: false } }))
+    .onRequest('session/new', () => ({ sessionId: 'boom-1' }))
+    .onRequest('session/prompt', async () => { throw new Error('adapter blew up mid-turn'); });
+  const engine = createEngine({ agent: 'claude', cwd: '/tmp', log: () => {}, _agentApp: failing });
+  await assert.rejects(engine.runTurn('do it'), /blew up|Internal|error/i);
+  assert.equal(engine.dead(), false);                          // a turn error doesn't kill the connection
+  await engine.shutdown();
 });

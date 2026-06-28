@@ -58,6 +58,21 @@ Concord room  <--REST long-poll-->  concord-agent (ACP client)  <--stdio-->  age
 
 `--budget N` caps fresh tokens per rolling window (`--budget-window-hours`, default 24); over budget pauses the agent and posts a note. `concord budget <id> --reset` / `concord resume <id>` clears the pause. `/usage` in-room shows current usage.
 
+## Limitations
+
+- **Restart = fresh agent context (cold cache).** Every (re)start opens a NEW ACP
+  session, so a `concord restart` / crash recovery loses the agent's in-session
+  conversation context and warm prompt cache — the next turn pays full fresh-token
+  cost. This is a deliberate trade for the simple "the adapter is our own child
+  group, reclaim is deterministic" model; it is **not** equivalent to a warm
+  `--resume`. (Cross-restart session reuse needs the adapter to advertise the ACP
+  `loadSession` capability, which the current adapters don't.)
+- **Budget needs per-turn usage.** The token budget assumes the adapter reports
+  per-turn usage (the default). If your adapter reports *cumulative* session totals,
+  set `ACP_USAGE_MODE=cumulative` so the budget counts per-turn deltas instead of
+  summing running totals. If the adapter omits usage entirely, the budget can't be
+  enforced and the host logs a one-time warning.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

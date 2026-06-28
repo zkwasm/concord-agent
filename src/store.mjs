@@ -67,6 +67,11 @@ export function openStore(filePath) {
     wasIntroduced(roomId) { return !!roomState(roomId).introduced; },
     setIntroduced(roomId) { roomState(roomId).introduced = true; persist(); },
 
+    // --- ACP adapter process-group pgid (so the CLI can reap an orphaned group
+    //     even if the bridge died without running its shutdown handler) ---
+    getAdapterPid() { return state.adapterPid ?? null; },
+    setAdapterPid(pid) { state.adapterPid = pid || null; persist(); },
+
     // --- per-agent (per-room) token accounting, for stats + budget guard ---
     getUsage(roomId) { return { ...usageState(roomId) }; },
     addUsage(roomId, fresh, cached, now) {

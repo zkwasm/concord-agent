@@ -11,7 +11,8 @@
 // Zero changes to Concord core. One npm dep: @agentclientprotocol/sdk (neutral,
 // Apache-2.0, by the protocol authors). The per-vendor adapter is launched on
 // demand (engine.mjs ADAPTERS); override with ACP_ADAPTER_CMD.
-import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { openStore } from './store.mjs';
 import { toolToProgress, toolDetail } from './render.mjs';
 import { resolveConfig, usage } from './cli.mjs';
@@ -61,7 +62,10 @@ function introText() {
 }
 
 const die = (m) => { console.error('✗ ' + m); process.exit(1); };
-const store = openStore(STORE_PATH || fileURLToPath(new URL('./bridge-state.json', import.meta.url)));
+// The CLI always injects STORE_PATH (~/.concord/hosts/<id>/state.json). The
+// fallback (direct `node acp-bridge.mjs` runs) goes to a WRITABLE user dir, never
+// next to the module — a globally-installed package dir is typically read-only.
+const store = openStore(STORE_PATH || join(homedir(), '.concord', 'bridge-state.json'));
 
 let CONCORD_ROOM_ID = cfg.roomId;
 // No room → browser handoff (shared, nonce-protected). Don't log the room id (bearer).
@@ -100,7 +104,24 @@ const sendToRoom = (text) => post('/messages', { sender: senderName, agentSessio
 // ---------------------------------------------------------------------------
 let busy = false;
 const pending = [];
-const engine = createEngine({ agent: AGENT, cwd: AGENT_CWD, permission: PERMISSION_POLICY, log: console.log });
+let engine = null;
+let usageWarned = false;
+
+// (Re)create the resident ACP engine: spawn the adapter, wait until the session is
+// live, and record the adapter's process-group pgid so the CLI can reap it even if
+// we die without running cleanShutdown. Throws if the adapter won't start.
+async function startEngine() {
+  engine = createEngine({ agent: AGENT, cwd: AGENT_CWD, permission: PERMISSION_POLICY, log: console.log });
+  await engine.ready;
+  store.setAdapterPid(engine.adapterPid());
+}
+// Before a turn: if the engine died (adapter crash / dropped connection), tear the
+// dead one down and bring up a fresh one so the host self-heals instead of dying.
+async function ensureEngine() {
+  if (engine && !engine.dead()) return;
+  if (engine) { console.warn('engine died → recreating'); try { await engine.shutdown(); } catch { /* best effort */ } }
+  await startEngine();
+}
 
 // Run one prompt turn through the engine. Tool-call ACP updates → one enriched
 // progress card per tool (toolToProgress in render.mjs). ACP sends `tool_call`
@@ -125,7 +146,11 @@ async function runTurn(text) {
     }
     toolState.set(id, st);
   };
-  const { reply, usage, stopReason } = await engine.runTurn(text, onUpdate);
+  const { reply, usage, stopReason, usagePresent } = await engine.runTurn(text, onUpdate);
+  if (!usagePresent && AGENT_TOKEN_BUDGET > 0 && !usageWarned) {
+    usageWarned = true;   // don't enforce a budget you can't measure — say so once, loudly.
+    console.warn('⚠️ adapter reports no token usage → the --budget cap cannot be enforced for this agent.');
+  }
   console.log(`■ turn end  ·  stop=${stopReason}  ·  fresh ${usage.fresh} tok, cache-read ${usage.cached} tok`);
   return { reply, usage };
 }
@@ -141,15 +166,33 @@ const budgetNote = () => sendToRoom(budgetExceededNote(store.getUsage(CONCORD_RO
 async function drain() {
   if (busy || pending.length === 0) return;
   busy = true;
-  while (pending.length) {
-    if (budgetBlocked(Date.now())) { await budgetNote(); pending.length = 0; break; } // drop queued; over budget
-    const msg = pending.shift();
-    console.log(`\n▶ turn start  ·  ${msg.slice(0, 80)}`);
-    const { reply, usage } = await runTurn(msg);
-    store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached, Date.now());
-    if (reply.trim()) await sendToRoom(reply.trim());      // agent's full reply -> room
+  try {
+    while (pending.length) {
+      if (budgetBlocked(Date.now())) { await budgetNote(); pending.length = 0; break; } // drop queued; over budget
+      // Self-heal: a dead engine (adapter crash / dropped connection) is rebuilt
+      // before the turn. If it won't come back, tell the room and stop draining;
+      // the next inbound message retries (poll waits 30s → no tight crash loop).
+      if (!engine || engine.dead()) {
+        try { await ensureEngine(); }
+        catch (e) { console.error('engine restart failed:', e.message); await sendToRoom(`⚠️ agent 暂时起不来(${String(e.message).slice(0, 120)}),稍后再发一次。`).catch(() => {}); break; }
+      }
+      const msg = pending.shift();
+      console.log(`\n▶ turn start  ·  ${msg.slice(0, 80)}`);
+      try {
+        const { reply, usage } = await runTurn(msg);
+        store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached, Date.now());
+        if (reply.trim()) await sendToRoom(reply.trim());      // agent's full reply -> room
+      } catch (e) {
+        // A mid-turn ACP failure must NOT crash the host (the #1 review finding).
+        // Surface it and keep the bridge alive; the next iteration rebuilds the
+        // engine if it died. Error notes post regardless of PROGRESS (not chatter).
+        console.error('turn failed:', e.message);
+        await sendToRoom(`⚠️ 这条没处理成功(${String(e.message).slice(0, 120)}),可以再发一次。`).catch(() => {});
+      }
+    }
+  } finally {
+    busy = false;   // ALWAYS reset, so a failure can't wedge the host busy forever
   }
-  busy = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -187,20 +230,29 @@ async function pollLoop() {
 // On stop/restart the CLI SIGTERMs us; shut the engine down so the ACP adapter +
 // the agent it spawns (our child process group) don't survive as orphans.
 let shuttingDown = false;
-function cleanShutdown(sig) {
+async function cleanShutdown(sig) {
   if (shuttingDown) return; shuttingDown = true;
   console.log(`\n${sig} → shutting down agent (${AGENT_CWD}) …`);
-  try { engine.shutdown(); } catch { /* best effort */ }
-  setTimeout(() => process.exit(0), 500);   // give the group-kill a moment, then exit
+  const hard = setTimeout(() => process.exit(0), 12000); hard.unref();   // backstop if shutdown wedges
+  // AWAIT the group-kill: engine.shutdown() group-SIGTERMs the adapter, waits for
+  // the group to actually exit, then group-SIGKILLs. We only exit AFTER it's gone —
+  // the SIGKILL backstop must not live in a process that exits before it fires.
+  try { if (engine) await engine.shutdown(); } catch { /* best effort */ }
+  store.setAdapterPid(null);   // group reaped → clear the pgid so the CLI doesn't re-reap a dead pid
+  process.exit(0);
 }
-process.on('SIGTERM', () => cleanShutdown('SIGTERM'));
-process.on('SIGINT', () => cleanShutdown('SIGINT'));
+process.on('SIGTERM', () => { cleanShutdown('SIGTERM'); });
+process.on('SIGINT', () => { cleanShutdown('SIGINT'); });
+// A stray fire-and-forget rejection (e.g. a sendToRoom losing the network) must
+// not take the whole host down — log and carry on. drain() handles turn-level
+// failures; this is the last-resort backstop (the #1 review finding).
+process.on('unhandledRejection', (reason) => { console.error('unhandledRejection (non-fatal):', reason?.message || reason); });
 // `concord resume` / `concord budget --reset` signals us to clear a budget pause
 // without a restart (we own the in-memory usage, so a file edit wouldn't be seen).
 process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); console.log('SIGUSR1 → budget window reset; accepting tasks again'); });
 
 await joinRoom();
-try { await engine.ready; } catch (e) { die(`agent failed to start: ${e?.message || e}`); }
+try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}`); }
 console.log(`✓ acp-bridge up. Driving "${AGENT}" over ACP in ${AGENT_CWD} (progress=${PROGRESS ? 'on' : 'off'}, permission=${PERMISSION_POLICY}).`);
 console.log(`  Idle = room long-poll + agent idle. Send a room message to wake it.`);
 pollLoop();

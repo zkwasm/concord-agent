@@ -11,14 +11,25 @@
 //
 //   this bridge (ACP client) <--ndjson stdio--> agent ACP adapter (server) <--> claude/codex/…
 //
-// The adapter subprocess is OUR child in its OWN process group, so `shutdown()`
-// kills the whole group (adapter + the agent it spawns). No detached resident
-// daemon → none of acpx's "orphaned queue-owner keeps burning tokens" class of
-// bug. A crashed bridge also closes the adapter's stdin (EOF) → well-behaved
-// adapters exit on their own.
+// The adapter subprocess is spawned `detached` so it is its OWN process-group
+// leader: child.pid == the group pgid, and `shutdown()` group-kills it (adapter
+// + the agent it spawns). shutdown() is ASYNC and waits for the group to actually
+// die before resolving, so a caller can reclaim deterministically (no fixed-delay
+// race). The group pgid is exposed (`adapterPid`) so a supervisor can reap an
+// orphaned group even if this process died without running shutdown().
+//
+// NOTE (resume): every engine starts a FRESH ACP session (buildSession().start()).
+// The SDK's high-level ActiveSession is new-only; session/load + session/resume
+// exist but require the adapter to advertise the capability (claude-agent-acp
+// reports loadSession:false) and lower-level update routing. So a bridge restart
+// = fresh agent context (cold prompt cache). This is a known PoC limitation, not
+// acpx `--resume` parity — see README "Limitations".
 import { spawn } from 'node:child_process';
 import { Writable, Readable } from 'node:stream';
 import * as acp from '@agentclientprotocol/sdk';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 // Pinned adapter versions — never float to @latest (supply-chain hygiene). Bump
 // deliberately. Override the whole launch with ACP_ADAPTER_CMD ("cmd a b c") or
@@ -54,16 +65,42 @@ export function decidePermission(params, policy = 'approve-all') {
   return { outcome: { outcome: 'cancelled' } };
 }
 
-// ACP per-turn Usage → our {fresh, cached} accounting (matches the old acpx path:
-// fresh = input+output, cached = cache-read). Usage is optional in ACP; absent → 0.
+// ACP per-turn Usage → our {fresh, cached} accounting (fresh = input+output,
+// cached = cache-read). Usage is optional in ACP; absent → 0. The ACP Usage
+// schema is ambiguous (PromptResponse.usage is documented "for this turn" but the
+// field descriptions say "across all turns") and flagged UNSTABLE, so the engine
+// supports both interpretations — see makeUsageMapper.
 export function usageOf(u = {}) {
   return { fresh: (u.inputTokens ?? 0) + (u.outputTokens ?? 0), cached: u.cachedReadTokens ?? 0 };
 }
 
+// Build a per-engine usage mapper. mode 'per-turn' (default): each turn's usage is
+// taken as-is. mode 'cumulative' (ACP_USAGE_MODE=cumulative): the adapter reports
+// running session totals, so report the DELTA vs the previous turn — otherwise the
+// budget would sum running totals and trip the cap far too early. Returns
+// { fresh, cached, present }; present=false when the adapter omitted usage (so the
+// caller can warn instead of silently letting the budget no-op).
+export function makeUsageMapper(mode = process.env.ACP_USAGE_MODE || 'per-turn') {
+  let prev = null;
+  return function map(raw) {
+    if (!raw || typeof raw !== 'object' || Object.keys(raw).length === 0) return { fresh: 0, cached: 0, present: false };
+    if (mode === 'cumulative') {
+      const p = prev || {};
+      const fresh = Math.max(0, ((raw.inputTokens ?? 0) + (raw.outputTokens ?? 0)) - ((p.inputTokens ?? 0) + (p.outputTokens ?? 0)));
+      const cached = Math.max(0, (raw.cachedReadTokens ?? 0) - (p.cachedReadTokens ?? 0));
+      prev = raw;
+      return { fresh, cached, present: true };
+    }
+    return { ...usageOf(raw), present: true };
+  };
+}
+
 // Create a resident ACP engine. Turns are serialized by the caller (one in flight).
-//   runTurn(text, onUpdate) → { reply, usage, stopReason }   (onUpdate(u) per session/update)
-//   shutdown()  → close the session + kill the adapter group
+//   runTurn(text, onUpdate) → { reply, usage:{fresh,cached}, stopReason, usagePresent }
+//   shutdown()  → Promise; group-kill the adapter and wait for the group to die
 //   ready       → resolves with the agent sessionId once the session is live
+//   dead()      → true once the connection failed or the adapter exited (recreate)
+//   adapterPid  → the adapter process-GROUP pgid (or null in test mode)
 // Test seam: pass `_agentApp` (an in-process acp.agent({...}) AgentApp) to drive
 // the real engine without a subprocess.
 export function createEngine({ agent, cwd, permission = 'approve-all', log = console.log, _agentApp = null } = {}) {
@@ -79,10 +116,16 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
 
   let session = null;
   let settled = false;
+  let failed = false;        // connection died / adapter exited unexpectedly → recreate
+  let exited = !child;       // adapter process has exited (true immediately in test mode)
   let readyResolve, readyReject;
-  const ready = new Promise((res, rej) => { readyResolve = (v) => { settled = true; res(v); }; readyReject = (e) => { if (!settled) { settled = true; rej(e); } }; });
+  const ready = new Promise((res, rej) => {
+    readyResolve = (v) => { settled = true; res(v); };
+    readyReject = (e) => { failed = true; if (!settled) { settled = true; rej(e); } };
+  });
   let shutdownResolve;
   const shutdownP = new Promise((r) => { shutdownResolve = r; });
+  const mapUsage = makeUsageMapper();
 
   const app = acp.client({ name: 'concord' })
     .onRequest(acp.methods.client.session.requestPermission, (ctx) => decidePermission(ctx.params, permission));
@@ -93,22 +136,24 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
     readyResolve(session.sessionId);
     await shutdownP;                          // hold the connection open across turns
     try { session.dispose(); } catch { /* already gone */ }
-  }).catch((e) => { readyReject(e); log('✗ ACP connection ended: ' + (e?.message || e)); });
+  }).catch((e) => { failed = true; readyReject(e); log('✗ ACP connection ended: ' + (e?.message || e)); });
 
   if (child) {
-    child.on('error', (e) => readyReject(e));
-    child.on('exit', (code, sig) => { readyReject(new Error(`adapter exited (code ${code}, sig ${sig})`)); });
+    child.on('error', (e) => { failed = true; readyReject(e); });
+    child.on('exit', (code, sig) => { exited = true; failed = true; readyReject(new Error(`adapter exited (code ${code}, sig ${sig})`)); });
   }
 
   async function runTurn(text, onUpdate = () => {}) {
     await ready;
     const done = session.prompt(text);        // fire the turn; resolves at stop
+    done.catch(() => {});                      // on the error path nextUpdate() rejects first; keep `done` from floating as an unhandled rejection
     let reply = '';
     for (;;) {
       const m = await session.nextUpdate();
       if (m.kind === 'stop') {
         await done;
-        return { reply, usage: usageOf(m.response?.usage || {}), stopReason: m.stopReason };
+        const u = mapUsage(m.response?.usage);
+        return { reply, usage: { fresh: u.fresh, cached: u.cached }, stopReason: m.stopReason, usagePresent: u.present };
       }
       const u = m.update;
       if (u.sessionUpdate === 'agent_message_chunk' && u.content?.type === 'text') reply += u.content.text;
@@ -116,13 +161,30 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
     }
   }
 
-  function shutdown() {
+  // Tear down: release the held-open connection, group-SIGTERM the adapter, WAIT
+  // for the group to actually exit (bounded), escalate to group-SIGKILL, and only
+  // resolve once it's gone. Async so the caller can exit *after* reclaim completes
+  // — the SIGKILL backstop must not live in a process that exits before it fires.
+  async function shutdown({ graceMs = 4000 } = {}) {
     shutdownResolve();
-    if (child && child.pid) {
-      try { process.kill(-child.pid, 'SIGTERM'); } catch { /* group already gone */ }
-      setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } }, 4000).unref();
+    if (!child || !child.pid) return;
+    const pgid = child.pid;
+    try { process.kill(-pgid, 'SIGTERM'); } catch { /* group already gone */ }
+    const start = Date.now();
+    while (!exited && pidAlive(pgid) && Date.now() - start < graceMs) await sleep(100);
+    if (!exited && pidAlive(pgid)) {
+      try { process.kill(-pgid, 'SIGKILL'); } catch { /* gone */ }
+      const s2 = Date.now();
+      while (pidAlive(pgid) && Date.now() - s2 < 2000) await sleep(100);
     }
   }
 
-  return { runTurn, shutdown, ready, sessionId: () => session?.sessionId ?? null };
+  return {
+    runTurn,
+    shutdown,
+    ready,
+    dead: () => failed,
+    sessionId: () => session?.sessionId ?? null,
+    adapterPid: () => child?.pid ?? null,   // the adapter process-group pgid (stable for its lifetime)
+  };
 }
