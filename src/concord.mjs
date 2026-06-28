@@ -174,8 +174,12 @@ function readUsage(id, room) {
 async function reapHostAdapter(id) {
   const { pid, start } = readAdapter(id);
   if (!pid) return false;
-  const { reaped } = await reapAdapterGroup({ pid, start }, { kill, startOf: procStart });
-  clearAdapter(id);
+  const { reaped, reason } = await reapAdapterGroup({ pid, start }, { kill, startOf: procStart });
+  // Clear only when the pid is genuinely done with — reaped, already-gone, or PROVEN
+  // recycled. On 'unverifiable' (ps failed / start never captured) keep the pid so a
+  // later sweep can retry once ps recovers; clearing it would permanently orphan a
+  // still-live burner (round-4 finding).
+  if (reason !== 'unverifiable') clearAdapter(id);
   return reaped;
 }
 // Crash-path backstop: reap orphaned adapter groups (supervisor dead, adapter still

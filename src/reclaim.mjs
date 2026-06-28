@@ -31,15 +31,21 @@ export function procStart(pid) {
 }
 
 // Reap an adapter GROUP, but ONLY when the live pid is verifiably the same process we
-// recorded (start-time match). A stale/unverifiable pid is NEVER group-killed — it is
-// reported 'reused-skip' so the caller can clear it instead. `startOf` injectable for tests.
+// recorded (start-time match). Returns a discriminated `reason` so the caller can tell
+// a PROVEN reuse (safe to forget the pid) from a merely UNVERIFIABLE one (ps failed /
+// start never captured — keep the pid and retry later; clearing it would permanently
+// orphan a live burner). A non-matching/unverifiable pid is NEVER group-killed.
+//   reason: 'no-pid' | 'gone' | 'unverifiable' | 'recycled' | 'reaped'
+// `startOf` injectable for tests.
 export async function reapAdapterGroup({ pid, start } = {}, opts = {}) {
   const { isAlive = defaultAlive, startOf = procStart } = opts;
-  if (!pid) return { steps: ['adapter:no-pid'], reaped: false };
-  if (!isAlive(pid)) return { steps: ['adapter:already-exited'], reaped: false };
-  if (!start || startOf(pid) !== start) return { steps: ['adapter:reused-skip'], reaped: false };  // PID reuse / unverifiable → do NOT kill
+  if (!pid) return { steps: ['adapter:no-pid'], reaped: false, reason: 'no-pid' };
+  if (!isAlive(pid)) return { steps: ['adapter:already-exited'], reaped: false, reason: 'gone' };
+  const live = startOf(pid);
+  if (!start || live == null) return { steps: ['adapter:unverifiable'], reaped: false, reason: 'unverifiable' };  // can't prove it's ours → don't kill, but keep tracking
+  if (live !== start) return { steps: ['adapter:reused-skip'], reaped: false, reason: 'recycled' };               // proven a DIFFERENT process → safe to forget
   const r = await reapPid(pid, { ...opts, group: true });
-  return { steps: ['adapter:' + r.steps.join('+')], reaped: r.alive === false };
+  return { steps: ['adapter:' + r.steps.join('+')], reaped: r.alive === false, reason: 'reaped' };
 }
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

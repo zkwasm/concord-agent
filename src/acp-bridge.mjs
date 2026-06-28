@@ -118,8 +118,9 @@ let warned80 = false;                 // one-time 80%-of-budget room note (per w
 let recreateTimes = [];               // timestamps of recent engine recreates (crash-loop guard)
 const RECREATE_WINDOW_MS = 5 * 60 * 1000;
 const RECREATE_MAX = 5;               // max engine recreates per window before we pause
-let consecutiveTimeouts = 0;          // a slow-but-burning prompt times out repeatedly; the recreate
-const MAX_CONSEC_TIMEOUTS = 3;        // cap (per 5min) can't catch 30-min turns, so bound it directly
+let timeoutTimes = [];                // timestamps of recent turn-timeouts. A WINDOW (not a consecutive
+const TIMEOUT_WINDOW_MS = 6 * 60 * 60 * 1000;   // count) so an alternating timeout/clean pattern can't launder
+const MAX_TIMEOUTS_WINDOW = 3;        // the streak: each timed-out turn burns ~ACP_TURN_TIMEOUT off-budget.
 let paused = false;                   // hard pause (repeated timeouts) — `concord resume` / restart clears
 
 // (Re)create the resident ACP engine: spawn the adapter, wait until the session is
@@ -129,7 +130,13 @@ async function startEngine() {
   engine = createEngine({ agent: AGENT, cwd: AGENT_CWD, permission: PERMISSION_POLICY, log: console.log });
   await engine.ready;
   const apid = engine.adapterPid();
-  store.setAdapterPid(apid, procStart(apid));   // record the start-time so an orphan reap can't kill a recycled pid
+  // Record the adapter's start-time so an orphan reap can't kill a recycled pid. A null
+  // start (ps hiccup) would DISABLE the guard for this host, so retry a few times; if it
+  // stays null, warn loudly — the safety net (orphan reaping) is off until ps recovers.
+  let start = procStart(apid);
+  for (let i = 0; i < 3 && apid && !start; i++) { await new Promise((r) => setTimeout(r, 100)); start = procStart(apid); }
+  if (apid && !start) console.warn('⚠️ could not read the adapter start-time (ps unavailable) — orphan reaping is disabled for this host until it can be verified.');
+  store.setAdapterPid(apid, start);
 }
 // Before a turn: if the engine died (adapter crash / dropped connection), tear the
 // dead one down and bring up a fresh one so the host self-heals instead of dying.
@@ -221,7 +228,6 @@ async function drain() {
       try {
         const { reply, usage } = await runTurn(msg);
         recreateTimes = [];                                    // a clean turn means the engine recovered → reset the crash-loop guard
-        consecutiveTimeouts = 0;
         store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached, Date.now());
         maybeBudgetWarn();                                     // surface 80%-of-budget before the cap pauses us
         if (reply.trim()) await sendToRoom(reply.trim());      // agent's full reply -> room
@@ -231,11 +237,15 @@ async function drain() {
         console.error('turn failed:', e.message);
         if (e && e.code === 'TURN_TIMEOUT') {
           // A timed-out turn isn't budget-billed (it never reached 'stop'), so the
-          // per-amount cap can't catch a slow-but-burning prompt that keeps timing
-          // out (incl. user resends). Bound it: pause after a few consecutive timeouts.
-          if (++consecutiveTimeouts >= MAX_CONSEC_TIMEOUTS) {
+          // per-amount cap can't catch a slow-but-burning prompt. Bound it by a WINDOW
+          // count (not consecutive — an alternating timeout/clean pattern must still
+          // converge to a pause; a clean turn does NOT launder a timeout's burn).
+          const now = Date.now();
+          timeoutTimes = timeoutTimes.filter((t) => now - t < TIMEOUT_WINDOW_MS);
+          timeoutTimes.push(now);
+          if (timeoutTimes.length >= MAX_TIMEOUTS_WINDOW) {
             paused = true; pending.length = 0;
-            await sendToRoom(`⏸️ 连续 ${MAX_CONSEC_TIMEOUTS} 轮超时,已暂停以免持续烧 token。换更小的任务后 \`concord resume ${''}\` 或 \`concord restart\`。`).catch(() => {});
+            await sendToRoom(`⏸️ 多次超时(${MAX_TIMEOUTS_WINDOW} 次),已暂停以免持续烧 token。用 \`concord list\` 找到 id 后 \`concord resume <id>\` 或 \`concord restart <id>\`。`).catch(() => {});
             break;
           }
           await sendToRoom(`⚠️ 这轮超时被取消了(${String(e.message).slice(0, 100)})。任务太大就拆小一点再发。`).catch(() => {});
@@ -305,7 +315,7 @@ process.on('SIGINT', () => { cleanShutdown('SIGINT'); });
 process.on('unhandledRejection', (reason) => { console.error('unhandledRejection (non-fatal):', reason?.message || reason); });
 // `concord resume` / `concord budget --reset` signals us to clear a budget pause
 // without a restart (we own the in-memory usage, so a file edit wouldn't be seen).
-process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); warned80 = false; paused = false; consecutiveTimeouts = 0; console.log('SIGUSR1 → budget window reset + unpaused; accepting tasks again'); });
+process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); warned80 = false; paused = false; timeoutTimes = []; console.log('SIGUSR1 → budget window reset + unpaused; accepting tasks again'); });
 
 await joinRoom();
 try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}`); }

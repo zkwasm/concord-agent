@@ -3,7 +3,7 @@
 // SIGTERM→SIGKILL and confirming each target is gone.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { reapPid, stopHost } from './reclaim.mjs';
+import { reapPid, reapAdapterGroup, stopHost } from './reclaim.mjs';
 
 const noSleep = () => Promise.resolve();
 
@@ -49,6 +49,37 @@ test('reapPid: already dead → never signalled', async () => {
   const r = await reapPid(5, { kill: (p, s) => (killed.push(s), true), isAlive: () => false, sleep: noSleep });
   assert.deepEqual(killed, []);
   assert.deepEqual(r.steps, ['already-exited']);
+});
+
+// --- reapAdapterGroup identity guard: the round-4 false-negative fix ---
+test('reapAdapterGroup: start match → reaps (reason=reaped)', async () => {
+  const w = gracefulWorld([200]);
+  const r = await reapAdapterGroup({ pid: 200, start: 'S' }, { ...w, startOf: () => 'S', sleep: noSleep });
+  assert.equal(r.reason, 'reaped');
+  assert.equal(r.reaped, true);
+  assert.ok(w.killed.some(([p]) => p === -200));
+});
+
+test('reapAdapterGroup: PROVEN recycled (different non-null start) → not killed, reason=recycled (safe to clear)', async () => {
+  const w = gracefulWorld([200]);
+  const r = await reapAdapterGroup({ pid: 200, start: 'OURS' }, { ...w, startOf: () => 'OTHER', sleep: noSleep });
+  assert.equal(r.reason, 'recycled');
+  assert.equal(r.reaped, false);
+  assert.ok(!w.killed.some(([p]) => p === -200));
+});
+
+test('reapAdapterGroup: UNVERIFIABLE (ps returns null at reap) → not killed, reason=unverifiable (caller must KEEP the pid)', async () => {
+  const w = gracefulWorld([200]);
+  const r = await reapAdapterGroup({ pid: 200, start: 'OURS' }, { ...w, startOf: () => null, sleep: noSleep });
+  assert.equal(r.reason, 'unverifiable');            // NOT 'recycled' — we couldn't prove reuse
+  assert.ok(!w.killed.some(([p]) => p === -200), 'never group-kill what we cannot verify');
+});
+
+test('reapAdapterGroup: start never recorded → unverifiable (not killed)', async () => {
+  const w = gracefulWorld([200]);
+  const r = await reapAdapterGroup({ pid: 200, start: null }, { ...w, startOf: () => 'whatever', sleep: noSleep });
+  assert.equal(r.reason, 'unverifiable');
+  assert.ok(!w.killed.some(([p]) => p === -200));
 });
 
 // --- stopHost (bridge + adapter group) ---
