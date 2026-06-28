@@ -63,12 +63,19 @@ function gracefulWorld(aliveSet) {
   };
 }
 
-test('stopHost: reaps the bridge AND the adapter group', async () => {
+test('stopHost: reaps the bridge AND the adapter group (start-time verified)', async () => {
   const w = gracefulWorld([100, 200]);
-  const { steps } = await stopHost({ pid: 100, adapterPid: 200 }, { ...w, sleep: noSleep, stepMs: 100, graceMs: 1000 });
+  const { steps } = await stopHost({ pid: 100, adapterPid: 200, adapterStart: 'S200' }, { ...w, startOf: () => 'S200', sleep: noSleep, stepMs: 100, graceMs: 1000 });
   assert.deepEqual(steps, ['bridge:SIGTERM+exited', 'adapter:SIGTERM+exited']);
   assert.ok(w.killed.some(([p, s]) => p === 100 && s === 'SIGTERM'));   // bridge signalled directly
   assert.ok(w.killed.some(([p, s]) => p === -200 && s === 'SIGTERM'));  // adapter signalled as a GROUP
+});
+
+test('stopHost: a RECYCLED adapter pid (start-time mismatch) is NEVER group-killed', async () => {
+  const w = gracefulWorld([100, 200]);                       // 200 is alive but no longer OUR adapter
+  const { steps } = await stopHost({ pid: 100, adapterPid: 200, adapterStart: 'OURS' }, { ...w, startOf: () => 'SOMEONE-ELSE', sleep: noSleep });
+  assert.deepEqual(steps, ['bridge:SIGTERM+exited', 'adapter:reused-skip']);
+  assert.ok(!w.killed.some(([p]) => p === -200), 'the recycled group must never be signalled');
 });
 
 test('stopHost: adapter already reaped by the bridge handler → no double-kill', async () => {
@@ -80,12 +87,12 @@ test('stopHost: adapter already reaped by the bridge handler → no double-kill'
 
 test('stopHost: crashed bridge (already gone) still reaps the orphaned adapter group', async () => {
   const w = gracefulWorld([200]);                          // bridge 100 already dead, adapter 200 orphaned
-  const { steps } = await stopHost({ pid: 100, adapterPid: 200 }, { ...w, sleep: noSleep });
+  const { steps } = await stopHost({ pid: 100, adapterPid: 200, adapterStart: 'S200' }, { ...w, startOf: () => 'S200', sleep: noSleep });
   assert.deepEqual(steps, ['bridge:already-exited', 'adapter:SIGTERM+exited']);
   assert.ok(w.killed.some(([p, s]) => p === -200 && s === 'SIGTERM'));  // orphan group reaped
 });
 
 test('stopHost: no pid / no adapter → nothing to do', async () => {
   const { steps } = await stopHost({}, { kill: () => true, isAlive: () => true, sleep: noSleep });
-  assert.deepEqual(steps, ['bridge:no-pid']);
+  assert.deepEqual(steps, ['bridge:no-pid', 'adapter:no-pid']);
 });

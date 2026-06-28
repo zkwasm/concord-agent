@@ -67,10 +67,12 @@ export function openStore(filePath) {
     wasIntroduced(roomId) { return !!roomState(roomId).introduced; },
     setIntroduced(roomId) { roomState(roomId).introduced = true; persist(); },
 
-    // --- ACP adapter process-group pgid (so the CLI can reap an orphaned group
-    //     even if the bridge died without running its shutdown handler) ---
+    // --- ACP adapter process-group pgid + its start-time signature (so the CLI can
+    //     reap an orphaned group even if the bridge died without its shutdown handler,
+    //     but ONLY if the live pid is the same incarnation — start-time guards against
+    //     killing a recycled pid that the OS handed to an unrelated process) ---
     getAdapterPid() { return state.adapterPid ?? null; },
-    setAdapterPid(pid) { state.adapterPid = pid || null; persist(); },
+    setAdapterPid(pid, start = null) { state.adapterPid = pid || null; state.adapterStart = pid ? (start || null) : null; persist(); },
 
     // --- per-agent (per-room) token accounting, for stats + budget guard ---
     getUsage(roomId) { return { ...usageState(roomId) }; },

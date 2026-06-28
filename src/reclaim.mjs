@@ -15,8 +15,32 @@
 //
 // `kill`/`isAlive`/`sleep` are injected for testing. `kill` must accept a NEGATIVE
 // pid for group signalling (node's process.kill does).
+import { execSync } from 'node:child_process';
 
 const defaultAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+// Start-time signature of a pid — uniquely identifies THIS process incarnation, so a
+// recycled pid (the OS handed the integer to an unrelated process after ours died)
+// will not match. Null if the pid is gone / ps is unavailable. This is the guard that
+// stops a stale recorded pgid from group-killing an innocent process (the user's
+// editor, a dev server, or another healthy host's adapter).
+export function procStart(pid) {
+  if (!pid) return null;
+  try { return execSync('ps -o lstart= -p ' + Number(pid), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null; }
+  catch { return null; }
+}
+
+// Reap an adapter GROUP, but ONLY when the live pid is verifiably the same process we
+// recorded (start-time match). A stale/unverifiable pid is NEVER group-killed — it is
+// reported 'reused-skip' so the caller can clear it instead. `startOf` injectable for tests.
+export async function reapAdapterGroup({ pid, start } = {}, opts = {}) {
+  const { isAlive = defaultAlive, startOf = procStart } = opts;
+  if (!pid) return { steps: ['adapter:no-pid'], reaped: false };
+  if (!isAlive(pid)) return { steps: ['adapter:already-exited'], reaped: false };
+  if (!start || startOf(pid) !== start) return { steps: ['adapter:reused-skip'], reaped: false };  // PID reuse / unverifiable → do NOT kill
+  const r = await reapPid(pid, { ...opts, group: true });
+  return { steps: ['adapter:' + r.steps.join('+')], reaped: r.alive === false };
+}
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Reap one target: SIGTERM, wait up to graceMs for it to exit, SIGKILL, brief
@@ -42,7 +66,7 @@ export async function reapPid(pid, { kill, isAlive = defaultAlive, sleep = defau
 // Stop a host: reap the bridge AND confirm the adapter group is gone.
 export async function stopHost(entry, opts = {}) {
   const { kill, isAlive = defaultAlive, sleep = defaultSleep, graceMs = 4000, stepMs = 200 } = opts;
-  const { pid, adapterPid } = entry || {};
+  const { pid, adapterPid, adapterStart } = entry || {};
   const steps = [];
 
   // 1. the bridge — its graceful handler reaps the adapter group on its own.
@@ -53,13 +77,9 @@ export async function stopHost(entry, opts = {}) {
   }
 
   // 2. the adapter GROUP — belt-and-suspenders for when the bridge handler didn't
-  //    run. If already gone (bridge reaped it), this is a no-op. Confirms the tree.
-  if (adapterPid && isAlive(adapterPid)) {
-    const r = await reapPid(adapterPid, { kill, isAlive, sleep, graceMs, stepMs, group: true });
-    steps.push('adapter:' + r.steps.join('+'));
-  } else if (adapterPid) {
-    steps.push('adapter:already-exited');
-  }
+  //    run. Identity-guarded: a recycled adapterPid is skipped, never group-killed.
+  const r2 = await reapAdapterGroup({ pid: adapterPid, start: adapterStart }, { kill, isAlive, sleep, graceMs, stepMs, startOf: opts.startOf });
+  steps.push(...r2.steps);
 
   return { steps };
 }

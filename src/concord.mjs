@@ -11,12 +11,12 @@
 // tree is dead before reporting success; `prune` sweeps orphaned adapter groups
 // left by a crashed supervisor. No orphan token-burn. See reclaim.mjs.
 import { spawn } from 'node:child_process';
-import { openSync, createReadStream, mkdirSync, readFileSync } from 'node:fs';
+import { openSync, createReadStream, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveConfig, parseArgs } from './cli.mjs';
 import { openRegistry, newId } from './hosts.mjs';
-import { stopHost, reapPid } from './reclaim.mjs';
+import { stopHost, reapAdapterGroup, procStart } from './reclaim.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { saveCreds, removeCreds, loadCreds } from './creds.mjs';
 
@@ -153,24 +153,39 @@ function logsHost(id, follow) {
   }
 }
 
-// The supervisor records the ACP adapter's process-group pgid in its state file
-// (so we can reap the group even if the supervisor died without cleanup).
-function readAdapterPid(id) {
-  try { return JSON.parse(readFileSync(reg.statePath(id), 'utf8')).adapterPid ?? null; } catch { return null; }
+// The supervisor records the ACP adapter's pgid + its start-time signature in the
+// state file, so an orphaned group can be reaped even if the supervisor died without
+// cleanup — but ONLY when the live pid is verifiably the same process (start-time
+// match), never a recycled pid the OS handed to something else.
+function readAdapter(id) {
+  try { const s = JSON.parse(readFileSync(reg.statePath(id), 'utf8')); return { pid: s.adapterPid ?? null, start: s.adapterStart ?? null }; }
+  catch { return { pid: null, start: null }; }
+}
+function clearAdapter(id) {
+  try { const p = reg.statePath(id); const s = JSON.parse(readFileSync(p, 'utf8')); s.adapterPid = null; s.adapterStart = null; writeFileSync(p, JSON.stringify(s, null, 2)); } catch { /* nothing to clear */ }
 }
 // Live token usage for a host (so `list`/`status` can surface a burner at a glance).
 function readUsage(id, room) {
   try { return JSON.parse(readFileSync(reg.statePath(id), 'utf8')).rooms?.[room]?.usage ?? null; } catch { return null; }
 }
-// Reap any orphaned adapter group (supervisor dead, adapter pgid still alive) — the
-// crash-path backstop, run automatically before every command so an orphan can't
-// burn unseen until the user happens to `prune`. Silent unless it actually reaps.
+// Reap a host's orphaned adapter group — identity-guarded (a recycled pid is skipped,
+// never killed) — and clear the recorded pid afterwards so the same stale integer is
+// acted on at most once instead of being re-rolled on every future command.
+async function reapHostAdapter(id) {
+  const { pid, start } = readAdapter(id);
+  if (!pid) return false;
+  const { reaped } = await reapAdapterGroup({ pid, start }, { kill, startOf: procStart });
+  clearAdapter(id);
+  return reaped;
+}
+// Crash-path backstop: reap orphaned adapter groups (supervisor dead, adapter still
+// alive AND verified ours). Run before MUTATING lifecycle commands only — never as a
+// destructive side effect of read-only `list`/`status`/`logs`/`help`. Silent unless it reaps.
 async function sweepOrphans() {
   try {
     for (const h of reg.list()) {
       if (h.alive) continue;
-      const apid = readAdapterPid(h.id);
-      if (apid && kill(apid, 0)) { await reapPid(apid, { kill, group: true }); console.log(`✓ reaped orphaned agent group for ${h.id} (its supervisor had died)`); }
+      if (await reapHostAdapter(h.id)) console.log(`✓ reaped orphaned agent group for ${h.id} (its supervisor had died)`);
     }
   } catch { /* best effort — never block a command on the sweep */ }
 }
@@ -178,7 +193,8 @@ async function sweepOrphans() {
 async function stopHostCmd(id, { silent } = {}) {
   const h = reg.get(id);
   if (!h) { if (!silent) die(`no such host: ${id}`); return; }
-  const { steps } = await stopHost({ ...h, adapterPid: readAdapterPid(id) }, { kill });
+  const a = readAdapter(id);
+  const { steps } = await stopHost({ ...h, adapterPid: a.pid, adapterStart: a.start }, { kill, startOf: procStart });
   reg.update(id, { pid: null, stopped: true, stoppedAt: Date.now() });
   if (!silent) console.log(`✓ stopped ${id} — reclaim: ${steps.join(' → ') || '(none)'}`);
 }
@@ -200,8 +216,7 @@ async function prune() {
   const reaped = [];
   for (const h of reg.list()) {
     if (h.alive) continue;                       // supervisor still running → leave it
-    const apid = readAdapterPid(h.id);
-    if (apid && kill(apid, 0)) { await reapPid(apid, { kill, group: true }); reaped.push(h.id); }
+    if (await reapHostAdapter(h.id)) reaped.push(h.id);
   }
   const dead = reg.pruneDead();
   const parts = [];
@@ -250,7 +265,10 @@ function logout(args) {
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
-await sweepOrphans();   // crash-path backstop: reap orphaned agent groups before anything else
+// Crash-path backstop, but ONLY before mutating lifecycle commands — a read-only
+// `list`/`status`/`logs`/`help` must never have a destructive side effect. (`prune`
+// does its own reap.) The reap itself is identity-guarded against PID reuse.
+if (['join', 'host', 'stop', 'restart'].includes(cmd)) await sweepOrphans();
 switch (cmd) {
   case 'join': case 'host': await startHost(cmd, rest); break;
   case 'login': await login(rest); break;

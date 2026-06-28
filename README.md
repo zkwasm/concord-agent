@@ -58,10 +58,10 @@ Concord room  <--REST long-poll-->  concord-agent (ACP client)  <--stdio-->  age
 
 The core guarantee: a hosted agent must never become a silent, bottomless token sink. The defenses, all on by default:
 
-- **Per-turn ceiling** — every single turn is bounded by a wall-clock timeout (`ACP_TURN_TIMEOUT`, default **1800s**; `0` disables). A degenerate/looping turn — or an adapter that never finishes — is cancelled and its process group killed, so one turn can't burn unbounded even with no `--budget`. Normal turns finish well under it.
+- **Per-turn ceiling** — every single turn is bounded by a wall-clock timeout (`ACP_TURN_TIMEOUT`, default **1800s**; `0` disables). A degenerate/looping turn — or an adapter that never finishes — is cancelled and its process group killed, so one turn can't burn unbounded even with no `--budget`. Normal turns finish well under it. After a few consecutive timeouts the host pauses itself (so a slow-but-burning prompt, including resends, can't keep re-burning) until `concord resume`/`restart`.
 - **`--budget N`** caps *fresh* tokens per rolling window (`--budget-window-hours`, default 24); over budget pauses the agent and posts a note, with an 80%-of-budget early warning. `concord budget <id> --reset` / `concord resume <id>` clears the pause. `/usage` in-room shows current usage; `concord list` shows a live `TOK` column and `concord status` a `used` line.
-- **Fail-loud** — a malformed `--budget` is rejected (never silently "unlimited"); if an adapter reports no usage, a set `--budget` posts a warning *into the room* (it can't be measured, so the per-turn ceiling is the floor).
-- **Crash-loop & orphan guards** — a crash-looping adapter is rate-limited (exponential backoff, then pause + `concord restart`); an orphaned adapter group left by a dead supervisor is reaped automatically at the start of any `concord` command (and by `concord stop`/`prune`).
+- **Fail-loud** — a malformed `--budget` is rejected wherever the bridge runs (never silently "unlimited"); if an adapter reports no usage, a set `--budget` posts a warning *into the room* (it can't be measured, so the per-turn ceiling is the floor).
+- **Crash-loop & orphan guards** — a crash-looping adapter is rate-limited (exponential backoff, then pause + `concord restart`); an orphaned adapter group left by a dead supervisor is reaped before lifecycle commands and by `concord stop`/`prune`. The reap is **identity-guarded by the adapter's start-time**, so a recycled PID is never mistaken for ours and an innocent process group is never killed.
 
 ## Limitations
 

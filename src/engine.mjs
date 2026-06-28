@@ -171,19 +171,22 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
     const secs = Math.round(turnTimeoutMs / 1000);
     const deadline = turnTimeoutMs ? Date.now() + turnTimeoutMs : Infinity;
     for (;;) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) { await abortTurn(secs); throw new Error(`turn exceeded the ${secs}s ceiling and was cancelled (raise with ACP_TURN_TIMEOUT)`); }
-      // Race each nextUpdate() against the remaining turn budget so a wedged adapter
-      // (never emits 'stop', never sends another update) can't hang the turn forever.
+      // Race each nextUpdate() against the remaining whole-turn budget so a wedged
+      // adapter (never emits 'stop', never sends another update) can't hang forever.
+      // We rely SOLELY on the race timer for the deadline (no separate top-of-loop
+      // pre-check): if a 'stop' is already buffered it resolves via microtask and wins
+      // the race even at delay 0, so a just-finished turn is never mislabeled as timed out.
       const np = session.nextUpdate();
       let timer;
       const m = turnTimeoutMs
-        ? await Promise.race([np, new Promise((res) => { timer = setTimeout(() => res(TURN_TIMEOUT), remaining); })]).finally(() => clearTimeout(timer))
+        ? await Promise.race([np, new Promise((res) => { timer = setTimeout(() => res(TURN_TIMEOUT), Math.max(0, deadline - Date.now())); })]).finally(() => clearTimeout(timer))
         : await np;
       if (m === TURN_TIMEOUT) {
         np.catch(() => {});                    // the raced update will never land — don't let it float
         await abortTurn(secs);
-        throw new Error(`turn exceeded the ${secs}s ceiling and was cancelled (raise with ACP_TURN_TIMEOUT)`);
+        const e = new Error(`turn exceeded the ${secs}s ceiling and was cancelled (raise with ACP_TURN_TIMEOUT)`);
+        e.code = 'TURN_TIMEOUT';               // so the bridge can count consecutive timeouts and pause the burn
+        throw e;
       }
       if (m.kind === 'stop') {
         await done;

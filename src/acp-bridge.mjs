@@ -19,6 +19,7 @@ import { resolveConfig, usage } from './cli.mjs';
 import { overBudget, windowElapsed, usageReport, budgetExceededNote } from './budget.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { createEngine } from './engine.mjs';
+import { procStart } from './reclaim.mjs';
 
 if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) { console.log(usage()); process.exit(0); }
 
@@ -37,6 +38,13 @@ const PERMISSION_POLICY = process.env.ACP_PERMISSION || 'approve-all';
 const STORE_PATH = process.env.STORE_PATH;   // persist sessionId + processed-id dedup (resume/idempotency)
 const AGENT_MODEL = cfg.model;           // optional, shown in the self-intro
 const AGENT_EFFORT = cfg.effort;         // optional, shown in the self-intro
+// Validate AT THE POINT OF USE (not only the CLI front door): a direct `node
+// acp-bridge.mjs` / env-driven run with a malformed budget must NOT silently become
+// "unlimited" via parseInt(...)||0 — that's the exact unbounded-sink P1 closes.
+if (cfg.budget != null && cfg.budget !== '' && !/^[1-9]\d*$/.test(String(cfg.budget).trim())) {
+  console.error(`✗ AGENT_TOKEN_BUDGET/--budget must be a positive integer (got "${cfg.budget}"); refusing to run unguarded.`);
+  process.exit(1);
+}
 const AGENT_TOKEN_BUDGET = parseInt(cfg.budget, 10) || 0;                 // max fresh tokens / window; 0 = unlimited
 const BUDGET_WINDOW_HOURS = parseFloat(cfg.budgetWindowHours) || 24;      // rolling window for the budget
 const BUDGET_WINDOW_MS = BUDGET_WINDOW_HOURS * 3600 * 1000;
@@ -110,6 +118,9 @@ let warned80 = false;                 // one-time 80%-of-budget room note (per w
 let recreateTimes = [];               // timestamps of recent engine recreates (crash-loop guard)
 const RECREATE_WINDOW_MS = 5 * 60 * 1000;
 const RECREATE_MAX = 5;               // max engine recreates per window before we pause
+let consecutiveTimeouts = 0;          // a slow-but-burning prompt times out repeatedly; the recreate
+const MAX_CONSEC_TIMEOUTS = 3;        // cap (per 5min) can't catch 30-min turns, so bound it directly
+let paused = false;                   // hard pause (repeated timeouts) — `concord resume` / restart clears
 
 // (Re)create the resident ACP engine: spawn the adapter, wait until the session is
 // live, and record the adapter's process-group pgid so the CLI can reap it even if
@@ -117,7 +128,8 @@ const RECREATE_MAX = 5;               // max engine recreates per window before 
 async function startEngine() {
   engine = createEngine({ agent: AGENT, cwd: AGENT_CWD, permission: PERMISSION_POLICY, log: console.log });
   await engine.ready;
-  store.setAdapterPid(engine.adapterPid());
+  const apid = engine.adapterPid();
+  store.setAdapterPid(apid, procStart(apid));   // record the start-time so an orphan reap can't kill a recycled pid
 }
 // Before a turn: if the engine died (adapter crash / dropped connection), tear the
 // dead one down and bring up a fresh one so the host self-heals instead of dying.
@@ -191,10 +203,11 @@ function maybeBudgetWarn() {
 }
 
 async function drain() {
-  if (busy || pending.length === 0) return;
+  if (busy || paused || pending.length === 0) return;
   busy = true;
   try {
     while (pending.length) {
+      if (paused) { pending.length = 0; break; }
       if (budgetBlocked(Date.now())) { await budgetNote(); pending.length = 0; break; } // drop queued; over budget
       // Self-heal: a dead engine (adapter crash / dropped connection) is rebuilt
       // before the turn. If it won't come back, tell the room and stop draining;
@@ -208,15 +221,27 @@ async function drain() {
       try {
         const { reply, usage } = await runTurn(msg);
         recreateTimes = [];                                    // a clean turn means the engine recovered → reset the crash-loop guard
+        consecutiveTimeouts = 0;
         store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached, Date.now());
         maybeBudgetWarn();                                     // surface 80%-of-budget before the cap pauses us
         if (reply.trim()) await sendToRoom(reply.trim());      // agent's full reply -> room
       } catch (e) {
         // A mid-turn ACP failure must NOT crash the host (the #1 review finding).
-        // Surface it and keep the bridge alive; the next iteration rebuilds the
-        // engine if it died. Error notes post regardless of PROGRESS (not chatter).
+        // Surface it and keep the bridge alive; the next iteration rebuilds the engine.
         console.error('turn failed:', e.message);
-        await sendToRoom(`⚠️ 这条没处理成功(${String(e.message).slice(0, 120)}),可以再发一次。`).catch(() => {});
+        if (e && e.code === 'TURN_TIMEOUT') {
+          // A timed-out turn isn't budget-billed (it never reached 'stop'), so the
+          // per-amount cap can't catch a slow-but-burning prompt that keeps timing
+          // out (incl. user resends). Bound it: pause after a few consecutive timeouts.
+          if (++consecutiveTimeouts >= MAX_CONSEC_TIMEOUTS) {
+            paused = true; pending.length = 0;
+            await sendToRoom(`⏸️ 连续 ${MAX_CONSEC_TIMEOUTS} 轮超时,已暂停以免持续烧 token。换更小的任务后 \`concord resume ${''}\` 或 \`concord restart\`。`).catch(() => {});
+            break;
+          }
+          await sendToRoom(`⚠️ 这轮超时被取消了(${String(e.message).slice(0, 100)})。任务太大就拆小一点再发。`).catch(() => {});
+        } else {
+          await sendToRoom(`⚠️ 这条没处理成功(${String(e.message).slice(0, 120)}),可以再发一次。`).catch(() => {});
+        }
       }
     }
   } finally {
@@ -242,6 +267,8 @@ async function pollLoop() {
           await sendToRoom(usageReport(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET, BUDGET_WINDOW_HOURS));
           continue;
         }
+        // Paused after repeated timeouts → don't enqueue (would just burn again).
+        if (paused) continue;
         // Already over budget when a task arrives → refuse cleanly (no false ack).
         if (budgetBlocked(Date.now())) { await budgetNote(); continue; }
         // First time someone talks to us in this room: introduce ourselves. (host only.)
@@ -278,7 +305,7 @@ process.on('SIGINT', () => { cleanShutdown('SIGINT'); });
 process.on('unhandledRejection', (reason) => { console.error('unhandledRejection (non-fatal):', reason?.message || reason); });
 // `concord resume` / `concord budget --reset` signals us to clear a budget pause
 // without a restart (we own the in-memory usage, so a file edit wouldn't be seen).
-process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); warned80 = false; console.log('SIGUSR1 → budget window reset; accepting tasks again'); });
+process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); warned80 = false; paused = false; consecutiveTimeouts = 0; console.log('SIGUSR1 → budget window reset + unpaused; accepting tasks again'); });
 
 await joinRoom();
 try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}`); }
