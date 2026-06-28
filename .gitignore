@@ -1,0 +1,5 @@
+node_modules/
+*.log
+src/bridge-state.json
+src/bridge-state.json.*
+.DS_Store
