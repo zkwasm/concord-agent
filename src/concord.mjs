@@ -80,6 +80,12 @@ function spawnDaemon(id, f, { fg }) {
 
 async function startHost(mode, args) {
   const cfg = resolveConfig(args, process.env);
+  // A malformed --budget must NEVER silently coerce to "unlimited" (parseInt('abc')→0).
+  // Reject it loudly at the entry point so the user sees the typo instead of an
+  // unguarded agent. Unset is the documented default (unlimited).
+  if (cfg.budget != null && !/^[1-9]\d*$/.test(String(cfg.budget).trim())) {
+    die(`--budget must be a positive integer (got "${cfg.budget}"). Omit it for no cap; a malformed value won't be treated as unlimited.`);
+  }
   const fg = args.includes('--fg');
   const cwd = cfg.cwd || process.cwd();
   // Resolve the room in the FOREGROUND (the user is present at start) — a detached
@@ -99,11 +105,13 @@ async function startHost(mode, args) {
 function listHosts() {
   const hosts = reg.list();
   if (!hosts.length) { console.log('(no hosted agents — `concord host <agent>` or `concord join <agent>`)'); return; }
-  console.log('ID                 AGENT    MODE  ROOM      STATUS    PID     UP');
+  console.log('ID                 AGENT    MODE  ROOM      STATUS    PID     UP     TOK');
   for (const h of hosts) {
     const status = h.stopped ? 'stopped' : h.alive ? 'running' : 'crashed';
+    const u = readUsage(h.id, h.room);
+    const tok = u ? String(u.fresh ?? 0) : '-';   // fresh tokens this window — a burner stands out at a glance
     console.log(
-      `${h.id.padEnd(18)} ${(h.agent || '').padEnd(8)} ${(h.mode || '').padEnd(5)} ${shortRoom(h.room).padEnd(9)} ${status.padEnd(9)} ${String(h.pid || '-').padEnd(7)} ${h.started ? ago(h.started) : '-'}`,
+      `${h.id.padEnd(18)} ${(h.agent || '').padEnd(8)} ${(h.mode || '').padEnd(5)} ${shortRoom(h.room).padEnd(9)} ${status.padEnd(9)} ${String(h.pid || '-').padEnd(7)} ${(h.started ? ago(h.started) : '-').padEnd(6)} ${tok}`,
     );
   }
 }
@@ -120,6 +128,7 @@ url     ${h.url}
 cwd     ${h.cwd}
 state   ${reg.statePath(h.id)}
 budget  ${h.budget ? `${h.budget} fresh tok / ${h.budgetWindowHours || 24}h` : 'unlimited'}
+used    ${(() => { const u = readUsage(h.id, h.room); return u ? `fresh ${u.fresh} · cache-read ${u.cached} · ${u.turns || 0} turns` : '(none yet)'; })()}
 logs    concord logs ${h.id}`);
 }
 
@@ -148,6 +157,22 @@ function logsHost(id, follow) {
 // (so we can reap the group even if the supervisor died without cleanup).
 function readAdapterPid(id) {
   try { return JSON.parse(readFileSync(reg.statePath(id), 'utf8')).adapterPid ?? null; } catch { return null; }
+}
+// Live token usage for a host (so `list`/`status` can surface a burner at a glance).
+function readUsage(id, room) {
+  try { return JSON.parse(readFileSync(reg.statePath(id), 'utf8')).rooms?.[room]?.usage ?? null; } catch { return null; }
+}
+// Reap any orphaned adapter group (supervisor dead, adapter pgid still alive) — the
+// crash-path backstop, run automatically before every command so an orphan can't
+// burn unseen until the user happens to `prune`. Silent unless it actually reaps.
+async function sweepOrphans() {
+  try {
+    for (const h of reg.list()) {
+      if (h.alive) continue;
+      const apid = readAdapterPid(h.id);
+      if (apid && kill(apid, 0)) { await reapPid(apid, { kill, group: true }); console.log(`✓ reaped orphaned agent group for ${h.id} (its supervisor had died)`); }
+    }
+  } catch { /* best effort — never block a command on the sweep */ }
 }
 
 async function stopHostCmd(id, { silent } = {}) {
@@ -225,6 +250,7 @@ function logout(args) {
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
+await sweepOrphans();   // crash-path backstop: reap orphaned agent groups before anything else
 switch (cmd) {
   case 'join': case 'host': await startHost(cmd, rest); break;
   case 'login': await login(rest); break;

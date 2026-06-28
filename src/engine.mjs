@@ -95,6 +95,18 @@ export function makeUsageMapper(mode = process.env.ACP_USAGE_MODE || 'per-turn')
   };
 }
 
+// Hard per-turn wall-clock ceiling. The budget is checked BETWEEN turns; this is
+// the WITHIN-turn backstop so a single degenerate/looping turn — or an adapter that
+// never emits 'stop' — can't burn unbounded. On timeout the turn is cancelled AND
+// the adapter group is killed (the LLM process dies → burn stops immediately); the
+// bridge then recreates a fresh engine. Default 1800s is generous (normal coding
+// turns finish well under it → no UX impact); ACP_TURN_TIMEOUT=0 disables it.
+const TURN_TIMEOUT_MS = (() => {
+  const raw = parseInt(process.env.ACP_TURN_TIMEOUT ?? '1800', 10);
+  return (Number.isFinite(raw) && raw >= 0 ? raw : 1800) * 1000;
+})();
+const TURN_TIMEOUT = Symbol('turn-timeout');
+
 // Create a resident ACP engine. Turns are serialized by the caller (one in flight).
 //   runTurn(text, onUpdate) → { reply, usage:{fresh,cached}, stopReason, usagePresent }
 //   shutdown()  → Promise; group-kill the adapter and wait for the group to die
@@ -103,7 +115,7 @@ export function makeUsageMapper(mode = process.env.ACP_USAGE_MODE || 'per-turn')
 //   adapterPid  → the adapter process-GROUP pgid (or null in test mode)
 // Test seam: pass `_agentApp` (an in-process acp.agent({...}) AgentApp) to drive
 // the real engine without a subprocess.
-export function createEngine({ agent, cwd, permission = 'approve-all', log = console.log, _agentApp = null } = {}) {
+export function createEngine({ agent, cwd, permission = 'approve-all', log = console.log, turnTimeoutMs = TURN_TIMEOUT_MS, _agentApp = null } = {}) {
   let child = null;
   let source;
   if (_agentApp) {
@@ -143,13 +155,36 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
     child.on('exit', (code, sig) => { exited = true; failed = true; readyReject(new Error(`adapter exited (code ${code}, sig ${sig})`)); });
   }
 
+  // A turn that exceeds the ceiling: kill the adapter group so the LLM burn stops
+  // now, mark the engine dead so the bridge rebuilds a fresh one next turn.
+  async function abortTurn(secs) {
+    log(`■ turn exceeded ${secs}s ceiling — cancelling + reaping the adapter to stop the burn`);
+    failed = true;
+    try { await shutdown(); } catch { /* best effort */ }
+  }
+
   async function runTurn(text, onUpdate = () => {}) {
     await ready;
     const done = session.prompt(text);        // fire the turn; resolves at stop
     done.catch(() => {});                      // on the error path nextUpdate() rejects first; keep `done` from floating as an unhandled rejection
     let reply = '';
+    const secs = Math.round(turnTimeoutMs / 1000);
+    const deadline = turnTimeoutMs ? Date.now() + turnTimeoutMs : Infinity;
     for (;;) {
-      const m = await session.nextUpdate();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) { await abortTurn(secs); throw new Error(`turn exceeded the ${secs}s ceiling and was cancelled (raise with ACP_TURN_TIMEOUT)`); }
+      // Race each nextUpdate() against the remaining turn budget so a wedged adapter
+      // (never emits 'stop', never sends another update) can't hang the turn forever.
+      const np = session.nextUpdate();
+      let timer;
+      const m = turnTimeoutMs
+        ? await Promise.race([np, new Promise((res) => { timer = setTimeout(() => res(TURN_TIMEOUT), remaining); })]).finally(() => clearTimeout(timer))
+        : await np;
+      if (m === TURN_TIMEOUT) {
+        np.catch(() => {});                    // the raced update will never land — don't let it float
+        await abortTurn(secs);
+        throw new Error(`turn exceeded the ${secs}s ceiling and was cancelled (raise with ACP_TURN_TIMEOUT)`);
+      }
       if (m.kind === 'stop') {
         await done;
         const u = mapUsage(m.response?.usage);

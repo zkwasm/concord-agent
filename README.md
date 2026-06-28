@@ -54,9 +54,14 @@ Concord room  <--REST long-poll-->  concord-agent (ACP client)  <--stdio-->  age
 - Node **>= 20**.
 - The coding agent you host must be installed and authenticated (e.g. `claude`). The ACP adapter is fetched on first use unless you set `ACP_ADAPTER_CMD`.
 
-## Token budget
+## Token safety
 
-`--budget N` caps fresh tokens per rolling window (`--budget-window-hours`, default 24); over budget pauses the agent and posts a note. `concord budget <id> --reset` / `concord resume <id>` clears the pause. `/usage` in-room shows current usage.
+The core guarantee: a hosted agent must never become a silent, bottomless token sink. The defenses, all on by default:
+
+- **Per-turn ceiling** — every single turn is bounded by a wall-clock timeout (`ACP_TURN_TIMEOUT`, default **1800s**; `0` disables). A degenerate/looping turn — or an adapter that never finishes — is cancelled and its process group killed, so one turn can't burn unbounded even with no `--budget`. Normal turns finish well under it.
+- **`--budget N`** caps *fresh* tokens per rolling window (`--budget-window-hours`, default 24); over budget pauses the agent and posts a note, with an 80%-of-budget early warning. `concord budget <id> --reset` / `concord resume <id>` clears the pause. `/usage` in-room shows current usage; `concord list` shows a live `TOK` column and `concord status` a `used` line.
+- **Fail-loud** — a malformed `--budget` is rejected (never silently "unlimited"); if an adapter reports no usage, a set `--budget` posts a warning *into the room* (it can't be measured, so the per-turn ceiling is the floor).
+- **Crash-loop & orphan guards** — a crash-looping adapter is rate-limited (exponential backoff, then pause + `concord restart`); an orphaned adapter group left by a dead supervisor is reaped automatically at the start of any `concord` command (and by `concord stop`/`prune`).
 
 ## Limitations
 
@@ -70,8 +75,9 @@ Concord room  <--REST long-poll-->  concord-agent (ACP client)  <--stdio-->  age
 - **Budget needs per-turn usage.** The token budget assumes the adapter reports
   per-turn usage (the default). If your adapter reports *cumulative* session totals,
   set `ACP_USAGE_MODE=cumulative` so the budget counts per-turn deltas instead of
-  summing running totals. If the adapter omits usage entirely, the budget can't be
-  enforced and the host logs a one-time warning.
+  summing running totals. If the adapter omits usage entirely, the by-amount budget
+  can't be enforced — the host says so in the room and the per-turn timeout ceiling
+  becomes the bound.
 
 ## License
 

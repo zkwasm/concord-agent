@@ -132,3 +132,18 @@ test('engine: a failing turn rejects runTurn cleanly; engine stays usable', asyn
   assert.equal(engine.dead(), false);                          // a turn error doesn't kill the connection
   await engine.shutdown();
 });
+
+// --- P0: a turn that never reaches 'stop' (wedged adapter / infinite loop) is
+//     BOUNDED by the per-turn wall-clock ceiling — the within-turn token-sink fix ---
+test('engine: a wedged turn is killed by the turn-timeout ceiling (no bottomless burn)', async () => {
+  const wedged = acp.agent({ name: 'wedged' })
+    .onRequest('initialize', () => ({ protocolVersion: acp.PROTOCOL_VERSION, agentCapabilities: { loadSession: false } }))
+    .onRequest('session/new', () => ({ sessionId: 'wedged-1' }))
+    .onRequest('session/prompt', () => new Promise(() => {}));  // never resolves → never emits 'stop'
+  const engine = createEngine({ agent: 'claude', cwd: '/tmp', log: () => {}, turnTimeoutMs: 400, _agentApp: wedged });
+  const t0 = Date.now();
+  await assert.rejects(engine.runTurn('loop forever'), /exceeded the .* ceiling/i);
+  assert.ok(Date.now() - t0 < 3000, 'turn was cancelled promptly, not left to hang');
+  assert.equal(engine.dead(), true);                           // adapter reaped → bridge will recreate
+  await engine.shutdown();
+});

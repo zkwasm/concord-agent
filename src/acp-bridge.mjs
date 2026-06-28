@@ -106,6 +106,10 @@ let busy = false;
 const pending = [];
 let engine = null;
 let usageWarned = false;
+let warned80 = false;                 // one-time 80%-of-budget room note (per window)
+let recreateTimes = [];               // timestamps of recent engine recreates (crash-loop guard)
+const RECREATE_WINDOW_MS = 5 * 60 * 1000;
+const RECREATE_MAX = 5;               // max engine recreates per window before we pause
 
 // (Re)create the resident ACP engine: spawn the adapter, wait until the session is
 // live, and record the adapter's process-group pgid so the CLI can reap it even if
@@ -117,9 +121,19 @@ async function startEngine() {
 }
 // Before a turn: if the engine died (adapter crash / dropped connection), tear the
 // dead one down and bring up a fresh one so the host self-heals instead of dying.
+// Rate-limited: a crash-looping adapter must NOT spawn adapter-after-adapter, each
+// burning a turn. Cap recreates per window with exponential backoff; past the cap,
+// throw so drain() pauses and the user must `concord restart` (no silent burn loop).
 async function ensureEngine() {
   if (engine && !engine.dead()) return;
   if (engine) { console.warn('engine died → recreating'); try { await engine.shutdown(); } catch { /* best effort */ } }
+  const now = Date.now();
+  recreateTimes = recreateTimes.filter((t) => now - t < RECREATE_WINDOW_MS);
+  if (recreateTimes.length >= RECREATE_MAX) {
+    throw new Error(`agent restarted ${RECREATE_MAX}× in ${Math.round(RECREATE_WINDOW_MS / 60000)}min — paused. Run \`concord restart\` once it's fixed.`);
+  }
+  if (recreateTimes.length > 0) await new Promise((r) => setTimeout(r, Math.min(30000, 500 * 2 ** recreateTimes.length)));
+  recreateTimes.push(Date.now());
   await startEngine();
 }
 
@@ -148,8 +162,10 @@ async function runTurn(text) {
   };
   const { reply, usage, stopReason, usagePresent } = await engine.runTurn(text, onUpdate);
   if (!usagePresent && AGENT_TOKEN_BUDGET > 0 && !usageWarned) {
-    usageWarned = true;   // don't enforce a budget you can't measure — say so once, loudly.
-    console.warn('⚠️ adapter reports no token usage → the --budget cap cannot be enforced for this agent.');
+    usageWarned = true;   // a set --budget that can't be measured must NOT silently become unlimited.
+    const w = `⚠️ 这个 agent 不上报 token 用量,设定的 --budget(${AGENT_TOKEN_BUDGET})无法按量强制执行;仅靠单轮超时兜底单轮上界。`;
+    console.warn(w);
+    sendToRoom(w).catch(() => {});   // safety-relevant fact → post regardless of PROGRESS (like turn-fail notes)
   }
   console.log(`■ turn end  ·  stop=${stopReason}  ·  fresh ${usage.fresh} tok, cache-read ${usage.cached} tok`);
   return { reply, usage };
@@ -158,10 +174,21 @@ async function runTurn(text) {
 // Roll the budget window, then report whether the fresh-token cap is hit — so a
 // runaway agent can't burn unbounded cost while nobody's watching.
 function budgetBlocked(now) {
-  if (windowElapsed(store.getUsage(CONCORD_ROOM_ID).windowStart, now, BUDGET_WINDOW_MS)) store.resetUsage(CONCORD_ROOM_ID, now);
+  if (windowElapsed(store.getUsage(CONCORD_ROOM_ID).windowStart, now, BUDGET_WINDOW_MS)) { store.resetUsage(CONCORD_ROOM_ID, now); warned80 = false; }
   return overBudget(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET);
 }
 const budgetNote = () => sendToRoom(budgetExceededNote(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET, BUDGET_WINDOW_HOURS));
+
+// Early-warning so spend is VISIBLE before the cap pauses the agent: one room note
+// when usage first crosses 80% of the budget this window. No-op if no budget.
+function maybeBudgetWarn() {
+  if (!AGENT_TOKEN_BUDGET || warned80) return;
+  const u = store.getUsage(CONCORD_ROOM_ID);
+  if (u.fresh >= AGENT_TOKEN_BUDGET * 0.8) {
+    warned80 = true;
+    sendToRoom(`⚠️ 已用 ${u.fresh}/${AGENT_TOKEN_BUDGET} fresh tok(≥80%),接近本窗口预算上限。`).catch(() => {});
+  }
+}
 
 async function drain() {
   if (busy || pending.length === 0) return;
@@ -180,7 +207,9 @@ async function drain() {
       console.log(`\n▶ turn start  ·  ${msg.slice(0, 80)}`);
       try {
         const { reply, usage } = await runTurn(msg);
+        recreateTimes = [];                                    // a clean turn means the engine recovered → reset the crash-loop guard
         store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached, Date.now());
+        maybeBudgetWarn();                                     // surface 80%-of-budget before the cap pauses us
         if (reply.trim()) await sendToRoom(reply.trim());      // agent's full reply -> room
       } catch (e) {
         // A mid-turn ACP failure must NOT crash the host (the #1 review finding).
@@ -249,7 +278,7 @@ process.on('SIGINT', () => { cleanShutdown('SIGINT'); });
 process.on('unhandledRejection', (reason) => { console.error('unhandledRejection (non-fatal):', reason?.message || reason); });
 // `concord resume` / `concord budget --reset` signals us to clear a budget pause
 // without a restart (we own the in-memory usage, so a file edit wouldn't be seen).
-process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); console.log('SIGUSR1 → budget window reset; accepting tasks again'); });
+process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); warned80 = false; console.log('SIGUSR1 → budget window reset; accepting tasks again'); });
 
 await joinRoom();
 try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}`); }
