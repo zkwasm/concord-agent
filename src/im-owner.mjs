@@ -112,7 +112,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   async function handleBind(chatId, chatType) {
     const existing = store.get(platform, chatId);
     if (existing) {
-      await send(chatId, `✓ 本聊天已绑定到 agent(room \`${short(existing.roomId)}\`)—— 直接发任务即可。\n要换一个 agent,在你机器上跑(复制即用):\n\`\`\`\nconcord host claude --bind ${chatId} --force\n\`\`\``);
+      await send(chatId, `✓ 本聊天已绑定到 agent(房间 ${short(existing.roomId)})—— 直接发任务即可。\n要换一个 agent,在你机器上跑:\n\`\`\`\nconcord host claude --bind ${chatId} --force\n\`\`\``);
       return { action: 'already-bound', roomId: existing.roomId };
     }
     const budget = chatType === 'group' ? ` --budget ${GROUP_DEFAULT_BUDGET}` : '';
@@ -145,7 +145,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     return parts.join('\n');
   }
   async function handleHelp(chatId) {
-    await send(chatId, ['🤖 **Concord agent 用法**', '· 直接发任务(群里 **@我**)', '· `/concord-bind` 绑定本聊天到一个 agent · `/concord-unbind` 解绑', '· `/usage` 看 token 用量'].join('\n'));
+    await send(chatId, ['🤖 **Concord agent 用法**', '· 直接发任务(群里 **@我**)', '· **/concord-bind** 绑定本聊天 · **/concord-unbind** 解绑', '· **/usage** 看用量 · **/agents** 看所有 agent'].join('\n'));
     return { action: 'help' };
   }
   // A normal message: instant ack (decision 4) + POST into the bound room. A bare command
@@ -153,7 +153,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   // agent's own handler matches it exactly.
   async function routeMessage(chatId, text, sender) {
     const b = store.get(platform, chatId);
-    if (!b) { await send(chatId, '本聊天还没绑 agent — 发 `/concord-bind` 设置。'); return { action: 'unbound' }; }
+    if (!b) { await send(chatId, '本聊天还没绑 agent —— 发 **/concord-bind** 设置。'); return { action: 'unbound' }; }
     if (sender) await send(chatId, '收到 👌');
     try {
       const rc = await ensureRoom(b.roomId, chatId);
@@ -201,7 +201,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
         if (notify) await send(b.chatId, `⚠️ 绑定失败:连不上房间(${String(e.message).slice(0, 80)})。`);
       }
     }
-    for (const [roomId, rc] of rooms) if (!bound.has(roomId)) { rc.polling = false; rooms.delete(roomId); log(`relay down: room ${short(roomId)} (unbound)`); await send(rc.chatId, '⚠️ 本聊天的 agent 已移除(`concord rm` 或 `/concord-unbind`)。发 `/concord-bind` 可重新绑定。').catch(() => {}); }
+    for (const [roomId, rc] of rooms) if (!bound.has(roomId)) { rc.polling = false; rooms.delete(roomId); log(`relay down: room ${short(roomId)} (unbound)`); await send(rc.chatId, '⚠️ 本聊天的 agent 已移除。发 **/concord-bind** 可重新绑定。').catch(() => {}); }
   }
 
   function start() {
