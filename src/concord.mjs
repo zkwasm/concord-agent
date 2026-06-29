@@ -259,7 +259,11 @@ async function rmHost(id) {
   if (!h) die(`no such host: ${id}`);
   await stopHostCmd(id, { silent: true });   // SIGTERM bridge + reap adapter group BEFORE we drop the pids/state
   reg.unregister(id, { removeState: true });
-  console.log(`✓ removed ${id} (stopped + reclaimed first — no orphans)`);
+  // Drop any IM binding pointing at this host's room, so the owner stops relaying a
+  // chat into a now-dead agent (the binding would otherwise linger and route into a void).
+  let unbound = 0;
+  if (h.room) { const b = openBindings(); for (const v of Object.values(b.list())) { if (v.roomId === h.room) { b.unbind(v.platform, v.chatId); unbound++; } } }
+  console.log(`✓ removed ${id} (stopped + reclaimed first — no orphans)${unbound ? ` · dropped ${unbound} IM binding(s)` : ''}`);
 }
 
 async function restartHost(id) {

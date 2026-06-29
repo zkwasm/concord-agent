@@ -115,6 +115,19 @@ test('syncRelays({notify:true}) joins a new binding and confirms "✓ 绑定成�
   } finally { cleanup(); }
 });
 
+test('/agents lists current bindings + count', async () => {
+  const { owner, client, store, cleanup } = freshOwner();
+  try {
+    store.bind('lark', 'oc_a', { roomId: 'room-aaaa1111', agent: 'claude' });
+    store.bind('lark', 'oc_b', { roomId: 'room-bbbb2222', agent: 'codex' });
+    const r = await owner.onEvent(ev({ text: '/agents', chatType: 'p2p', chatId: 'oc_a' }));
+    assert.equal(r.action, 'agents');
+    assert.equal(r.count, 2);
+    assert.match(client.sent.at(-1).text, /claude/);
+    assert.match(client.sent.at(-1).text, /codex/);
+  } finally { cleanup(); }
+});
+
 test('duplicate message_id is dropped (Lark redelivery)', async () => {
   const { owner, cleanup } = freshOwner();
   try {

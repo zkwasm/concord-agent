@@ -100,22 +100,33 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   async function handleBind(chatId, chatType) {
     const existing = store.get(platform, chatId);
     if (existing) {
-      await send(chatId, `✓ 本聊天已绑定到 agent(room \`${short(existing.roomId)}\`)—— 直接发任务即可。\n要换一个 agent:在你机器上跑 \`concord host claude --bind ${chatId} --force\``);
+      await send(chatId, `✓ 本聊天已绑定到 agent(room \`${short(existing.roomId)}\`)—— 直接发任务即可。\n要换一个 agent,在你机器上跑(复制即用):\n\`\`\`\nconcord host claude --bind ${chatId} --force\n\`\`\``);
       return { action: 'already-bound', roomId: existing.roomId };
     }
     const budget = chatType === 'group' ? ` --budget ${GROUP_DEFAULT_BUDGET}` : '';
-    await send(chatId, `本聊天(${chatType}, \`${chatId}\`)还没绑 agent。在你机器上跑:\n\`concord host claude --bind ${chatId}${budget}\`\n这会起一个 agent 并把本聊天绑给它。`);
+    await send(chatId, `本聊天还没绑 agent。在你机器上跑(复制即用):\n\`\`\`\nconcord host claude --bind ${chatId}${budget}\n\`\`\`\n跑完这台聊天就接上 agent 了。`);
     return { action: 'prompted', chatId, chatType };
   }
   async function handleUnbind(chatId) {
     const ok = store.unbind(platform, chatId);
-    await send(chatId, ok ? '✓ 已解绑,本聊天不再路由到 agent。' : '本聊天当前没有绑定。');
+    if (!ok) await send(chatId, '本聊天当前没有绑定。');
+    // On success the fs.watch → syncRelays "relay down" path posts the removal notice,
+    // so an unbind from `concord rm` (terminal, can't message the chat) is announced too.
     return { action: ok ? 'unbound' : 'not-bound' };
+  }
+  async function handleAgents(chatId) {
+    const all = Object.values(store.list()).filter((b) => b.platform === platform);
+    if (!all.length) { await send(chatId, '当前没有绑定的 agent —— 发 `/concord-bind` 绑一个。'); return { action: 'agents', count: 0 }; }
+    const lines = [`🤖 **当前 ${all.length} 个绑定的 agent**`, ...all.map((b) => `· **${b.agent || 'agent'}** · chat \`${short(b.chatId)}\` → room \`${short(b.roomId)}\`${rooms.has(b.roomId) ? ' · ✓在线' : ' · ⚠️离线'}`)];
+    await send(chatId, lines.join('\n'));
+    return { action: 'agents', count: all.length };
   }
   // First-contact self-intro, posted to the chat when its binding comes up.
   function introText(b) {
+    const n = Object.values(store.list()).filter((x) => x.platform === platform).length;
     const parts = [`🤖 **${b.agent || 'agent'}** 已接入,绑定成功 —— 直接发任务即可(群里请 **@我**)。`];
     if (b.cwd) parts.push(`工作目录:\`${b.cwd}\``);
+    parts.push(`当前共 **${n}** 个绑定的 agent(\`/agents\` 查看全部、防止开太多)。`);
     parts.push('`/usage` 看用量 · `/help` 看用法 · `/concord-unbind` 解绑。');
     return parts.join('\n');
   }
@@ -150,6 +161,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     if (d.action === 'bind') return handleBind(chatId, m.chat_type);
     if (d.action === 'unbind') return handleUnbind(chatId);
     if (d.action === 'help') return handleHelp(chatId);
+    if (d.action === 'agents') return handleAgents(chatId);
     if (d.action === 'usage') return routeMessage(chatId, '/usage', null);   // bare → the agent's own /usage handler
     if (d.action === 'message') return routeMessage(chatId, d.text, await resolveName(data?.sender?.sender_id?.open_id));
     return { action: d.action };   // 'ignore'
@@ -175,7 +187,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
         if (notify) await send(b.chatId, `⚠️ 绑定失败:连不上房间(${String(e.message).slice(0, 80)})。`);
       }
     }
-    for (const [roomId, rc] of rooms) if (!bound.has(roomId)) { rc.polling = false; rooms.delete(roomId); log(`relay down: room ${short(roomId)} (unbound)`); }
+    for (const [roomId, rc] of rooms) if (!bound.has(roomId)) { rc.polling = false; rooms.delete(roomId); log(`relay down: room ${short(roomId)} (unbound)`); await send(rc.chatId, '⚠️ 本聊天的 agent 已移除(`concord rm` 或 `/concord-unbind`)。发 `/concord-bind` 可重新绑定。').catch(() => {}); }
   }
 
   function start() {

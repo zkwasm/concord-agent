@@ -39,6 +39,11 @@ test('usage query detected; group usage still needs the @', () => {
   assert.equal(classifyInbound({ text: '@bot /stats', chatType: 'group', mentions: [{ key: '@_u' }] }).action, 'usage');
 });
 
+test('/agents → agents action', () => {
+  assert.equal(classifyInbound({ text: '/agents', chatType: 'p2p' }).action, 'agents');
+  assert.equal(classifyInbound({ text: '@bot /agents', chatType: 'group', mentions: [{ key: '@_u' }] }).action, 'agents');
+});
+
 test('/help (and 帮助) → help action; group still needs the @', () => {
   assert.equal(classifyInbound({ text: '/help', chatType: 'p2p' }).action, 'help');
   assert.equal(classifyInbound({ text: '帮助', chatType: 'p2p' }).action, 'help');

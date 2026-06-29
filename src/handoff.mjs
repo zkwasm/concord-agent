@@ -27,10 +27,11 @@ export function obtainRoomId(publicUrl, { log = console.log } = {}) {
       if (q.get('nonce') !== nonce) { res.writeHead(403).end('bad nonce'); return; }   // reject forged callbacks
       const roomId = q.get('room');
       if (!roomId) { res.writeHead(400).end('missing room'); return; }
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'Connection': 'close' });
       res.end('<!doctype html><meta charset=utf-8><body style="font-family:sans-serif;background:#0d1117;color:#e6edf3;display:flex;min-height:100vh;align-items:center;justify-content:center"><div>✓ Room connected. Close this tab and return to the terminal.</div></body>');
+      clearTimeout(timer);          // got the room → cancel the watchdog so it can't keep the CLI alive
       server.close();
-      clearTimeout(timer);          // got the room → cancel the watchdog so it can't keep the CLI alive (the "hangs after selecting" bug)
+      server.closeAllConnections?.();   // browsers keep-alive the callback connection → force-drop it so the CLI exits promptly (the "hangs, must Ctrl+C" bug)
       resolve(roomId);
     });
     server.on('error', (e) => { clearTimeout(timer); reject(e); });
