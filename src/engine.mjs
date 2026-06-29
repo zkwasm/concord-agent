@@ -122,6 +122,12 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
     source = _agentApp;                       // in-process agent (tests)
   } else {
     const { cmd, args } = adapterFor(agent);
+    // First use on a machine fetches the adapter via `npx` — and the claude adapter pulls
+    // a ~250MB platform-native agent runtime, which can take minutes. Announce it so a slow
+    // first run reads as "downloading" not "hung" (this await is what blocked startup before
+    // pollLoop). Subsequent runs hit the npx cache and start instantly.
+    log(`▸ starting the ${agent} adapter: ${cmd} ${args.join(' ')}`);
+    log(`  (first use on this machine downloads the agent runtime, ~250MB — can take a few minutes; cached afterwards)`);
     child = spawn(cmd, args, { cwd, stdio: ['pipe', 'pipe', 'inherit'], detached: true });
     source = acp.ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout));
   }

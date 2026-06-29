@@ -376,7 +376,7 @@ process.on('unhandledRejection', (reason) => { console.error('unhandledRejection
 process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); warned80 = false; paused = false; timeoutTimes = []; console.log('SIGUSR1 → budget window reset + unpaused; accepting tasks again'); });
 
 await joinRoom();
-try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}`); }
+try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}\n  (first run fetches the ACP adapter via npx — check network access to the npm registry, or pre-warm it by running the command printed above)`); }
 try { await startIm(); } catch (e) { console.warn('IM bridge failed to start (room-only): ' + (e?.message || e)); }
 console.log(`✓ acp-bridge up. Driving "${AGENT}" over ACP in ${AGENT_CWD} (progress=${PROGRESS ? 'on' : 'off'}, permission=${PERMISSION_POLICY}${IM_PLATFORM ? `, im=${IM_PLATFORM}` : ''}).`);
 console.log(`  Idle = room long-poll + agent idle. Send a room${IM_PLATFORM ? `/IM` : ''} message to wake it.`);
