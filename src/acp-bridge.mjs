@@ -264,7 +264,11 @@ async function drain() {
         recreateTimes = [];                                    // a clean turn means the engine recovered → reset the crash-loop guard
         store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached, Date.now());
         maybeBudgetWarn();                                     // surface 80%-of-budget before the cap pauses us
+        // Never go silent: a clean turn can end with no assistant text (Claude Code
+        // sometimes puts the conclusion in a post_turn_summary the ACP adapter drops).
+        // The progress cards already show the work — this just confirms the turn ended.
         if (reply.trim()) await out(reply.trim());             // agent's full reply -> room + IM chat
+        else await out('✓ 完成');
       } catch (e) {
         // A mid-turn ACP failure must NOT crash the host (the #1 review finding).
         // Surface it and keep the bridge alive; the next iteration rebuilds the engine.
