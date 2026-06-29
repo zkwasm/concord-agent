@@ -105,7 +105,20 @@ async function joinRoom() {
   die('could not join room');
 }
 
-const sendToRoom = (text) => post('/messages', { sender: senderName, agentSessionId: sessionId, content: text });
+// The room caps a single message body at 2MB (HTTP) and hard-truncates content past
+// ~50k chars. fetch never throws on an HTTP error status, so a too-large reply would be
+// rejected (413) and vanish silently. On 413, resend a truncated version so the chat
+// gets the (clipped) reply instead of nothing — same "never go silent" rule as a turn end.
+const ROOM_MSG_LIMIT = 45000;
+async function sendToRoom(text) {
+  const body = { sender: senderName, agentSessionId: sessionId, content: text };
+  const res = await post('/messages', body);
+  if (res.status === 413) {
+    return post('/messages', { ...body, content: text.slice(0, ROOM_MSG_LIMIT) + '\n\n…(回复过大,已截断)' });
+  }
+  if (!res.ok) console.warn(`room post ${res.status} — message may not have landed`);
+  return res;
+}
 
 // ---------------------------------------------------------------------------
 // IM bridge (personal mode) — only when `concord host --im <platform>` set. Lazy so a
