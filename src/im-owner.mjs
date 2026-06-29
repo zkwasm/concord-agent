@@ -15,6 +15,7 @@ import { loadCreds } from './creds.mjs';
 import { openBindings } from './im-bindings.mjs';
 import { classifyInbound } from './im-routing.mjs';
 import { cleanText } from './im-lark.mjs';
+import { shouldUseCard, buildCard } from './im-render.mjs';
 
 const DOMAINS = { lark: Lark.Domain.Lark, feishu: Lark.Domain.Feishu };
 const GROUP_DEFAULT_BUDGET = 1000000;   // a group binding defaults to this (the only token gate once "anyone triggers")
@@ -36,10 +37,22 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   async function send(chatId, text) {
     if (!chatId || !text) return;
     const asText = () => client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) } });
+    if (!shouldUseCard(text)) { await asText().catch((e) => log('owner text send failed: ' + e.message)); return; }   // status lines as plain text
     try {
-      const card = { config: { wide_screen_mode: true }, elements: [{ tag: 'markdown', content: text }] };
-      await client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) } });
+      await client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(buildCard(text)) } });
     } catch (e) { log('owner card send failed → text: ' + e.message); await asText().catch((e2) => log('owner text send failed: ' + e2.message)); }
+  }
+
+  // Best-effort display name for an open_id (cached) so the agent sees "张三: task" not
+  // the raw open_id. Falls back to the id tail if the contact scope isn't granted.
+  const nameCache = new Map();
+  async function resolveName(openId) {
+    if (!openId) return 'user';
+    if (nameCache.has(openId)) return nameCache.get(openId);
+    let name = openId.slice(-6);
+    try { const r = await client.contact.v3.user.get({ path: { user_id: openId }, params: { user_id_type: 'open_id' } }); name = r?.data?.user?.name || name; } catch { /* contact scope may be absent */ }
+    nameCache.set(openId, name);
+    return name;
   }
 
   // ---- Room side: join (relay identity), post inbound, poll for agent replies ----
@@ -87,7 +100,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   async function handleBind(chatId, chatType) {
     const existing = store.get(platform, chatId);
     if (existing) {
-      await send(chatId, `本聊天已绑定到 room \`${short(existing.roomId)}\`。要重绑,在你机器上跑:\n\`concord host claude --bind ${chatId} --force\``);
+      await send(chatId, `✓ 本聊天已绑定到 agent(room \`${short(existing.roomId)}\`)—— 直接发任务即可。\n要换一个 agent:在你机器上跑 \`concord host claude --bind ${chatId} --force\``);
       return { action: 'already-bound', roomId: existing.roomId };
     }
     const budget = chatType === 'group' ? ` --budget ${GROUP_DEFAULT_BUDGET}` : '';
@@ -99,14 +112,27 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     await send(chatId, ok ? '✓ 已解绑,本聊天不再路由到 agent。' : '本聊天当前没有绑定。');
     return { action: ok ? 'unbound' : 'not-bound' };
   }
-  // A normal message: instant ack (decision 4), then POST into the bound room.
+  // First-contact self-intro, posted to the chat when its binding comes up.
+  function introText(b) {
+    const parts = [`🤖 **${b.agent || 'agent'}** 已接入,绑定成功 —— 直接发任务即可(群里请 **@我**)。`];
+    if (b.cwd) parts.push(`工作目录:\`${b.cwd}\``);
+    parts.push('`/usage` 看用量 · `/help` 看用法 · `/concord-unbind` 解绑。');
+    return parts.join('\n');
+  }
+  async function handleHelp(chatId) {
+    await send(chatId, ['🤖 **Concord agent 用法**', '· 直接发任务(群里 **@我**)', '· `/concord-bind` 绑定本聊天到一个 agent · `/concord-unbind` 解绑', '· `/usage` 看 token 用量'].join('\n'));
+    return { action: 'help' };
+  }
+  // A normal message: instant ack (decision 4) + POST into the bound room. A bare command
+  // (sender=null, e.g. /usage) is posted verbatim (no "name:" prefix, no ack) so the
+  // agent's own handler matches it exactly.
   async function routeMessage(chatId, text, sender) {
     const b = store.get(platform, chatId);
     if (!b) { await send(chatId, '本聊天还没绑 agent — 发 `/concord-bind` 设置。'); return { action: 'unbound' }; }
-    await send(chatId, '收到 👌');
+    if (sender) await send(chatId, '收到 👌');
     try {
       const rc = await ensureRoom(b.roomId, chatId);
-      await roomPost(b.roomId, rc.sessionId, rc.relaySender, `${sender}: ${text}`);
+      await roomPost(b.roomId, rc.sessionId, rc.relaySender, sender ? `${sender}: ${text}` : text);
     } catch (e) { log('route failed: ' + e.message); await send(chatId, `⚠️ 转发到 agent 失败(${String(e.message).slice(0, 80)})`); return { action: 'route-failed' }; }
     return { action: 'routed', roomId: b.roomId };
   }
@@ -120,12 +146,13 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     const text = cleanText(raw, m.mentions);
     const d = classifyInbound({ text, chatType: m.chat_type, mentions: m.mentions });
     const chatId = m.chat_id;
-    const sender = data?.sender?.sender_id?.open_id || 'user';
     log(`[owner] ${m.chat_type} ${short(chatId)} text=${JSON.stringify(text.slice(0, 40))} → ${d.action}`);
     if (d.action === 'bind') return handleBind(chatId, m.chat_type);
     if (d.action === 'unbind') return handleUnbind(chatId);
-    if (d.action === 'message') return routeMessage(chatId, d.text, sender);
-    return { action: d.action };   // 'ignore' | 'usage'
+    if (d.action === 'help') return handleHelp(chatId);
+    if (d.action === 'usage') return routeMessage(chatId, '/usage', null);   // bare → the agent's own /usage handler
+    if (d.action === 'message') return routeMessage(chatId, d.text, await resolveName(data?.sender?.sender_id?.open_id));
+    return { action: d.action };   // 'ignore'
   }
 
   // Bring up relays for every current binding; rebuild on bindings-file changes so a
@@ -142,7 +169,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
       if (rooms.has(b.roomId)) continue;
       try {
         await ensureRoom(b.roomId, b.chatId);
-        if (notify) await send(b.chatId, '✓ 绑定成功,agent 已就位 —— 直接发任务给我吧。');
+        if (notify) await send(b.chatId, introText(b));
       } catch (e) {
         log('relay start failed: ' + e.message);
         if (notify) await send(b.chatId, `⚠️ 绑定失败:连不上房间(${String(e.message).slice(0, 80)})。`);

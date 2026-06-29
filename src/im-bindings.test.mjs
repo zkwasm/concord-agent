@@ -14,9 +14,9 @@ function freshStore() {
 test('bind + get round-trips, keyed per chat', () => {
   const { store, cleanup } = freshStore();
   try {
-    const r = store.bind('lark', 'oc_g1', { roomId: 'room-1', chatType: 'group', chatName: '后端' }, { now: 111 });
+    const r = store.bind('lark', 'oc_g1', { roomId: 'room-1', chatType: 'group', chatName: '后端', agent: 'claude', cwd: '/x' }, { now: 111 });
     assert.equal(r.ok, true);
-    assert.deepEqual(store.get('lark', 'oc_g1'), { platform: 'lark', chatId: 'oc_g1', roomId: 'room-1', chatType: 'group', chatName: '后端', boundAt: 111 });
+    assert.deepEqual(store.get('lark', 'oc_g1'), { platform: 'lark', chatId: 'oc_g1', roomId: 'room-1', chatType: 'group', chatName: '后端', agent: 'claude', cwd: '/x', boundAt: 111 });
     assert.equal(store.get('lark', 'oc_other'), null);
   } finally { cleanup(); }
 });

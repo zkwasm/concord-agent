@@ -128,7 +128,7 @@ async function startHost(mode, args) {
   if (cfg.bind) {
     const platform = resolveImPlatform(cfg, 'host');
     if (!platform) die('--bind needs a logged-in IM platform — run: concord login lark --app-id <id> --app-secret <secret>');
-    const res = openBindings().bind(platform, cfg.bind, { roomId: room, chatType: null, chatName: null }, { force: cfg.force });
+    const res = openBindings().bind(platform, cfg.bind, { roomId: room, agent: cfg.agent, cwd }, { force: cfg.force });
     if (!res.ok) die(`chat ${cfg.bind} is already bound to room ${shortRoom(res.existing.roomId)} — add --force to rebind`);
     bound = true;
     const owner = reg.list().find((h) => h.mode === 'im' && h.platform === platform && h.alive);

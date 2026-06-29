@@ -14,6 +14,7 @@ export function commandOf(text) {
 const BIND = new Set(['/concord-bind', 'concord-bind']);
 const UNBIND = new Set(['/concord-unbind', 'concord-unbind']);
 const USAGE = new Set(['/usage', '/stats', '用量']);
+const HELP = new Set(['/help', 'help', '帮助']);
 
 // Decide what the owner should do with one inbound message.
 //   chatType: 'p2p' | 'group'        mentions: Lark mentions array (group @ signal)
@@ -28,6 +29,7 @@ export function classifyInbound({ text, chatType, mentions } = {}) {
   const cmd = commandOf(clean);
   if (BIND.has(cmd)) return { action: 'bind' };
   if (UNBIND.has(cmd)) return { action: 'unbind' };
+  if (HELP.has(cmd)) return { action: 'help' };
   if (USAGE.has(cmd)) return { action: 'usage' };
   return { action: 'message', text: clean };
 }

@@ -39,6 +39,13 @@ test('usage query detected; group usage still needs the @', () => {
   assert.equal(classifyInbound({ text: '@bot /stats', chatType: 'group', mentions: [{ key: '@_u' }] }).action, 'usage');
 });
 
+test('/help (and 帮助) → help action; group still needs the @', () => {
+  assert.equal(classifyInbound({ text: '/help', chatType: 'p2p' }).action, 'help');
+  assert.equal(classifyInbound({ text: '帮助', chatType: 'p2p' }).action, 'help');
+  assert.equal(classifyInbound({ text: '/help', chatType: 'group', mentions: [] }).action, 'ignore');
+  assert.equal(classifyInbound({ text: '@bot /help', chatType: 'group', mentions: [{ key: '@_u' }] }).action, 'help');
+});
+
 test('a message that merely contains the word is still a message, not a command', () => {
   assert.equal(classifyInbound({ text: 'how do I use concord-bind?', chatType: 'p2p' }).action, 'message');
 });

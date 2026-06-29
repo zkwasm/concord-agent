@@ -27,13 +27,13 @@ export function openBindings(root = ROOT) {
     list() { return load(); },
     // Bind a chat to a room. Refuses to clobber an existing binding unless force —
     // the caller turns {ok:false, existing} into the "already bound, use --force" prompt.
-    bind(platform, chatId, { roomId, chatType = null, chatName = null } = {}, { force = false, now = Date.now() } = {}) {
+    bind(platform, chatId, { roomId, chatType = null, chatName = null, agent = null, cwd = null } = {}, { force = false, now = Date.now() } = {}) {
       if (!platform || !chatId) throw new Error('bind needs platform + chatId');
       if (!roomId) throw new Error('bind needs a roomId');
       const all = load();
       const k = keyOf(platform, chatId);
       if (all[k] && !force) return { ok: false, existing: all[k] };
-      all[k] = { platform, chatId, roomId, chatType, chatName, boundAt: now };
+      all[k] = { platform, chatId, roomId, chatType, chatName, agent, cwd, boundAt: now };
       persist(all);
       return { ok: true, binding: all[k] };
     },
