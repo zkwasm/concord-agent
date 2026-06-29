@@ -55,14 +55,15 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     return name;
   }
 
-  // Best-effort chat/group name for a chat_id (cached), so the intro / /agents say which
-  // room. Empty for p2p or when the chat:read scope is absent.
-  const chatNameCache = new Map();
-  async function resolveChatName(chatId) {
-    if (chatNameCache.has(chatId)) return chatNameCache.get(chatId);
+  // The CONCORD ROOM's name (not the Lark chat's), via the agent REST /info endpoint —
+  // so the intro / /agents say which room the chat is bound to. The room id is itself
+  // the bearer, so a bare GET suffices. Cached, best-effort.
+  const roomNameCache = new Map();
+  async function resolveRoomName(roomId) {
+    if (roomNameCache.has(roomId)) return roomNameCache.get(roomId);
     let name = '';
-    try { const r = await client.im.v1.chat.get({ path: { chat_id: chatId } }); name = r?.data?.name || ''; } catch { /* p2p / scope absent */ }
-    chatNameCache.set(chatId, name);
+    try { const r = await fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/info`); if (r.ok) name = (await r.json())?.name || ''; } catch { /* best effort */ }
+    roomNameCache.set(roomId, name);
     return name;
   }
 
@@ -129,18 +130,18 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     const all = Object.values(store.list()).filter((b) => b.platform === platform);
     if (!all.length) { await send(chatId, '当前没有绑定的 agent —— 发 `/concord-bind` 绑一个。'); return { action: 'agents', count: 0 }; }
     const lines = [`🤖 **当前 ${all.length} 个绑定的 agent**`];
-    for (const b of all) { const nm = await resolveChatName(b.chatId); lines.push(`· **${b.agent || 'agent'}**${nm ? `·「${nm}」` : ''} · room \`${short(b.roomId)}\`${rooms.has(b.roomId) ? ' · ✓在线' : ' · ⚠️离线'}`); }
+    for (const b of all) { const nm = await resolveRoomName(b.roomId); lines.push(`· **${b.agent || 'agent'}** · 房间「${nm || short(b.roomId)}」${rooms.has(b.roomId) ? ' · ✓在线' : ' · ⚠️离线'}`); }
     await send(chatId, lines.join('\n'));
     return { action: 'agents', count: all.length };
   }
   // First-contact self-intro, posted to the chat when its binding comes up.
-  function introText(b, chatName) {
+  function introText(b, roomName) {
     const n = Object.values(store.list()).filter((x) => x.platform === platform).length;
-    const where = chatName ? `「${chatName}」` : '本聊天';
-    const parts = [`🤖 **${b.agent || 'agent'}** 已接入 ${where},绑定成功 —— 直接发任务即可(群里请 **@我**)。`];
-    if (b.cwd) parts.push(`工作目录:\`${b.cwd}\``);
-    parts.push(`当前共 **${n}** 个绑定的 agent(\`/agents\` 查看全部、防止开太多)。`);
-    parts.push('`/usage` 看用量 · `/help` 看用法 · `/concord-unbind` 解绑。');
+    const where = roomName ? `房间「${roomName}」` : `房间 ${short(b.roomId)}`;
+    const parts = [`🤖 **${b.agent || 'agent'}** 已接入,绑定成功(${where})—— 直接发任务即可(群里请 **@我**)。`];
+    if (b.cwd) parts.push(`工作目录:${b.cwd}`);
+    parts.push(`当前共 **${n}** 个绑定的 agent(发 /agents 查看全部,防止开太多)。`);
+    parts.push('/usage 看用量 · /help 看用法 · /concord-unbind 解绑。');
     return parts.join('\n');
   }
   async function handleHelp(chatId) {
@@ -194,7 +195,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
       if (rooms.has(b.roomId)) continue;
       try {
         await ensureRoom(b.roomId, b.chatId);
-        if (notify) await send(b.chatId, introText(b, await resolveChatName(b.chatId)));
+        if (notify) await send(b.chatId, introText(b, await resolveRoomName(b.roomId)));
       } catch (e) {
         log('relay start failed: ' + e.message);
         if (notify) await send(b.chatId, `⚠️ 绑定失败:连不上房间(${String(e.message).slice(0, 80)})。`);
