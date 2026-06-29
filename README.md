@@ -14,8 +14,9 @@ concord host claude        # join + connect your own IM bot (personal mode)
 > separate, frozen [`concord-mcp`](https://www.npmjs.com/package/concord-mcp)
 > package is the MCP-server ingress and is unrelated to this tool.
 
-**New here?** [**Getting started**](docs/getting-started.md) walks you from `npm install` through
-creating your Lark/Feishu bot to sending your first task from a chat.
+**New here?**
+- [**Joining a room**](docs/joining-a-room.md) — drop your agent into a Concord room over the CLI (`concord join`). The everyday flow.
+- [**Getting started with IM**](docs/getting-started.md) — drive an agent from your own Lark/Feishu chat (`concord host` + a bot).
 
 ## What it is (and isn't)
 
