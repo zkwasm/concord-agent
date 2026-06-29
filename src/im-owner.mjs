@@ -55,6 +55,17 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     return name;
   }
 
+  // Best-effort chat/group name for a chat_id (cached), so the intro / /agents say which
+  // room. Empty for p2p or when the chat:read scope is absent.
+  const chatNameCache = new Map();
+  async function resolveChatName(chatId) {
+    if (chatNameCache.has(chatId)) return chatNameCache.get(chatId);
+    let name = '';
+    try { const r = await client.im.v1.chat.get({ path: { chat_id: chatId } }); name = r?.data?.name || ''; } catch { /* p2p / scope absent */ }
+    chatNameCache.set(chatId, name);
+    return name;
+  }
+
   // ---- Room side: join (relay identity), post inbound, poll for agent replies ----
   // Join as "IM"; if that name is taken in the room (409 — e.g. a previous owner's
   // session lingers after a restart), retry with a pid-suffixed name. Returns the
@@ -117,14 +128,16 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   async function handleAgents(chatId) {
     const all = Object.values(store.list()).filter((b) => b.platform === platform);
     if (!all.length) { await send(chatId, '当前没有绑定的 agent —— 发 `/concord-bind` 绑一个。'); return { action: 'agents', count: 0 }; }
-    const lines = [`🤖 **当前 ${all.length} 个绑定的 agent**`, ...all.map((b) => `· **${b.agent || 'agent'}** · chat \`${short(b.chatId)}\` → room \`${short(b.roomId)}\`${rooms.has(b.roomId) ? ' · ✓在线' : ' · ⚠️离线'}`)];
+    const lines = [`🤖 **当前 ${all.length} 个绑定的 agent**`];
+    for (const b of all) { const nm = await resolveChatName(b.chatId); lines.push(`· **${b.agent || 'agent'}**${nm ? `·「${nm}」` : ''} · room \`${short(b.roomId)}\`${rooms.has(b.roomId) ? ' · ✓在线' : ' · ⚠️离线'}`); }
     await send(chatId, lines.join('\n'));
     return { action: 'agents', count: all.length };
   }
   // First-contact self-intro, posted to the chat when its binding comes up.
-  function introText(b) {
+  function introText(b, chatName) {
     const n = Object.values(store.list()).filter((x) => x.platform === platform).length;
-    const parts = [`🤖 **${b.agent || 'agent'}** 已接入,绑定成功 —— 直接发任务即可(群里请 **@我**)。`];
+    const where = chatName ? `「${chatName}」` : '本聊天';
+    const parts = [`🤖 **${b.agent || 'agent'}** 已接入 ${where},绑定成功 —— 直接发任务即可(群里请 **@我**)。`];
     if (b.cwd) parts.push(`工作目录:\`${b.cwd}\``);
     parts.push(`当前共 **${n}** 个绑定的 agent(\`/agents\` 查看全部、防止开太多)。`);
     parts.push('`/usage` 看用量 · `/help` 看用法 · `/concord-unbind` 解绑。');
@@ -181,7 +194,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
       if (rooms.has(b.roomId)) continue;
       try {
         await ensureRoom(b.roomId, b.chatId);
-        if (notify) await send(b.chatId, introText(b));
+        if (notify) await send(b.chatId, introText(b, await resolveChatName(b.chatId)));
       } catch (e) {
         log('relay start failed: ' + e.message);
         if (notify) await send(b.chatId, `⚠️ 绑定失败:连不上房间(${String(e.message).slice(0, 80)})。`);

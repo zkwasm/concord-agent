@@ -51,6 +51,7 @@ Usage:
   concord budget <id> [--reset]      Show token usage / clear a budget pause
   concord resume <id>                Clear a budget pause (accept tasks again)
   concord rm <id> | prune            Stop + reclaim (if running) then remove an entry / drop dead ones
+  concord shutdown                   Stop EVERYTHING — IM owner + all agents + clear all bindings
   concord version                    Show the concord-agent version (also -v / --version)
   concord help
 
@@ -292,6 +293,16 @@ async function prune() {
   console.log('✓ ' + parts.join(' · '));
 }
 
+// One-shot teardown: stop the IM owner + every agent, then clear all IM bindings.
+// "I'm done" — leaves zero processes and zero bindings.
+async function shutdownAll() {
+  const hosts = reg.list();
+  for (const h of hosts) { await stopHostCmd(h.id, { silent: true }); reg.unregister(h.id, { removeState: true }); console.log(`✓ stopped + removed ${h.id}`); }
+  const b = openBindings(); const n = Object.keys(b.list()).length; b.clear();
+  console.log(`✓ cleared ${n} IM binding(s)`);
+  console.log(hosts.length ? '✓ all concord services stopped — clean slate.' : '(nothing was running)');
+}
+
 // Clear a budget pause on a running host (SIGUSR1 — the daemon resets its window).
 function resumeHost(id) {
   const h = reg.get(id);
@@ -384,6 +395,7 @@ switch (cmd) {
   case 'restart': rest[0] ? await restartHost(rest[0]) : die('usage: concord restart <id>'); break;
   case 'rm': rest[0] ? await rmHost(rest[0]) : die('usage: concord rm <id>'); break;
   case 'prune': await prune(); break;
+  case 'shutdown': await shutdownAll(); break;
   case 'resume': rest[0] ? resumeHost(rest[0]) : die('usage: concord resume <id>'); break;
   case 'budget': rest[0] ? budgetCmd(rest[0], rest.slice(1)) : die('usage: concord budget <id> [--reset]'); break;
   case 'version': case '--version': case '-v': console.log(`concord-agent ${VERSION}`); break;
