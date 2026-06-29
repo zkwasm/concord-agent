@@ -28,10 +28,10 @@ const reg = openRegistry();
 const USAGE = `concord — host coding agents in Concord rooms (stdio supervisor)
 
 Usage:
-  concord join <agent> [--room <id>] [--cwd .] [--budget N] [--fg]
+  concord join <agent> [room] [--cwd .] [--budget N] [--fg]
       Host a coding agent into a Concord room (web / multi-agent). Progress OFF.
-      No --room → opens a browser to create/pick one, then starts.
-  concord host <agent> [--room <id>] [--cwd .] [--budget N] [--im lark|feishu] [--fg]
+      No room → opens a browser to create/pick one, then starts. (or --room <id>)
+  concord host <agent> [room] [--cwd .] [--budget N] [--im lark|feishu] [--fg]
       join + connect your own IM bot (personal mode). Progress ON. Talk to the agent
       from Lark/Feishu — private chat (no @) or @-mention in a group. --im picks the
       platform; omit it if exactly one is logged in (concord login). No creds → room-only.
@@ -48,6 +48,7 @@ Usage:
   concord help
 
 Hosts run in the background by default (-d implied); pass --fg to stay foreground.
+Server: https://concord.fenginwind.com by default; --url http://localhost:3001 (or CONCORD_URL) for self-hosted/dev.
 agent: claude | gemini | codex | cursor | copilot | …  (default: claude)`;
 
 const die = (m) => { console.error('✗ ' + m); process.exit(1); };

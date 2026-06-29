@@ -24,10 +24,10 @@ The "resident session = zero idle tokens" value comes from ACP itself; this tool
 ## Commands
 
 ```
-concord join <agent> [--room <id>] [--cwd .] [--budget N] [--fg]
+concord join <agent> [room] [--cwd .] [--budget N] [--fg]
     Host a coding agent in a Concord room (web / multi-agent). Progress OFF.
     No --room → opens a browser to create/pick one, then starts.
-concord host <agent> [--room <id>] [--cwd .] [--budget N] [--fg]
+concord host <agent> [room] [--cwd .] [--budget N] [--fg]
     join + connect your own IM bot (personal mode). Progress ON.
 concord login lark|feishu --app-id <id> [--app-secret <s>]   Store your own bot creds (0600)
 concord logout [lark|feishu]

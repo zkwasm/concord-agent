@@ -33,9 +33,16 @@ test('resolveConfig: env used when no flags; name defaults to agent', () => {
 test('resolveConfig: bare defaults', () => {
   const cfg = resolveConfig([], {});
   assert.equal(cfg.agent, 'claude');
-  assert.equal(cfg.url, 'http://localhost:3001');
+  assert.equal(cfg.url, 'https://concord.fenginwind.com');
   assert.equal(cfg.roomId, null);
   assert.equal(cfg.cwd, null);           // caller fills with process.cwd()
+});
+
+test('resolveConfig: room id can be the 2nd positional (concord join <agent> <room>)', () => {
+  assert.equal(resolveConfig(['claude', 'room-xyz'], {}).roomId, 'room-xyz');                  // bare positional room
+  assert.equal(resolveConfig(['claude', 'room-xyz'], {}).agent, 'claude');                     // 1st positional stays the agent
+  assert.equal(resolveConfig(['claude', 'pos', '--room', 'flag'], {}).roomId, 'flag');         // --room wins over positional
+  assert.equal(resolveConfig(['claude', 'pos'], { CONCORD_ROOM_ID: 'env' }).roomId, 'pos');    // explicit positional beats env
 });
 
 test('resolveConfig: --name and --public-url honored', () => {

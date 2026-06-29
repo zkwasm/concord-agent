@@ -23,15 +23,15 @@ export function parseArgs(argv) {
 }
 
 export function usage() {
-  return `concord host <agent> [options]
+  return `concord <join|host> <agent> [room] [options]
 
   Host a coding agent in a Concord room — ACP-driven (official @agentclientprotocol/sdk), resident, idle = zero tokens.
 
   <agent>                     agent: claude | codex | gemini | … (default: claude)
 
-  --room <id>                 Concord room to join. Omit → opens a browser to create/pick one.
+  --room <id>                 Concord room to join (or pass positionally: concord join <agent> <id>). Omit → browser to create/pick one.
   --cwd <dir>                 Working directory the agent operates in (default: current dir)
-  --url <url>                 Concord server base (default: http://localhost:3001)
+  --url <url>                 Concord server base (default: https://concord.fenginwind.com; use http://localhost:3001 for local dev)
   --name <name>              Agent display name in the room (default: <agent>)
   --budget <n>                Max fresh tokens per window, then pause (default: unlimited)
   --budget-window-hours <h>   Rolling budget window in hours (default: 24)
@@ -56,9 +56,9 @@ export function resolveConfig(argv, env = {}) {
     agent,
     name: pick('name', 'AGENT_NAME', agent),
     cwd: pick('cwd', 'AGENT_CWD', null),
-    url: pick('url', 'CONCORD_URL', 'http://localhost:3001'),
+    url: pick('url', 'CONCORD_URL', 'https://concord.fenginwind.com'),       // hosted Concord by default; --url http://localhost:3001 for local dev
     publicUrl: pick('public-url', 'CONCORD_PUBLIC_URL', null),
-    roomId: pick('room', 'CONCORD_ROOM_ID', null),
+    roomId: flags.room ?? positional[1] ?? env.CONCORD_ROOM_ID ?? null,      // --room > positional (concord join <agent> <room>) > env > web handoff
     model: pick('model', 'AGENT_MODEL', ''),
     effort: pick('effort', 'AGENT_EFFORT', ''),
     budget: pick('budget', 'AGENT_TOKEN_BUDGET', null),                       // max fresh tokens / window; null = unlimited
