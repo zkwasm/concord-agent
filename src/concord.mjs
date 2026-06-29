@@ -19,10 +19,12 @@ import { openRegistry, newId } from './hosts.mjs';
 import { stopHost, reapAdapterGroup, procStart } from './reclaim.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { saveCreds, removeCreds, loadCreds, getCreds } from './creds.mjs';
+import { openBindings } from './im-bindings.mjs';
 
 const IM_PLATFORMS = ['lark', 'feishu'];
 
 const SUPERVISOR = fileURLToPath(new URL('./acp-bridge.mjs', import.meta.url));
+const OWNER = fileURLToPath(new URL('./im-owner.mjs', import.meta.url));
 const VERSION = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).version;
 const reg = openRegistry();
 
@@ -36,6 +38,9 @@ Usage:
       join + connect your own IM bot (personal mode). Progress ON. Talk to the agent
       from Lark/Feishu — private chat (no @) or @-mention in a group. --im picks the
       platform; omit it if exactly one is logged in (concord login). No creds → room-only.
+  concord im [stop|status|logs]      IM owner: owns your bot + relays bound chats (one per bot)
+  concord host <agent> --bind <chat_id> [--budget N] [--force]
+      Bind an IM chat (sent /concord-bind there) to a fresh agent; the owner routes it here.
   concord login lark|feishu --app-id <id> [--app-secret <s>]   Store your own bot creds (0600)
   concord logout [lark|feishu]       Remove stored creds
   concord list                       List hosted agents
@@ -83,7 +88,7 @@ function resolveImPlatform(cfg, mode) {
 }
 
 function spawnDaemon(id, f, { fg }) {
-  const env = { ...process.env, STORE_PATH: reg.statePath(id), ACP_PROGRESS: f.mode === 'host' ? '1' : '0', ACP_IM: f.im || '' };
+  const env = { ...process.env, STORE_PATH: reg.statePath(id), ACP_PROGRESS: f.bound ? '0' : (f.mode === 'host' ? '1' : '0'), ACP_IM: f.im || '' };
   const supArgs = buildSupArgs(f);
   if (fg) {
     reg.register({ id, ...f });
@@ -116,10 +121,24 @@ async function startHost(mode, args) {
   let room = cfg.roomId;
   if (!room) { room = await obtainRoomId(cfg.publicUrl || cfg.url); console.log('  → room connected.'); }
 
-  const im = resolveImPlatform(cfg, mode);
+  // --bind: record a chat→room binding so the `concord im` owner relays this chat here.
+  // Bound agents run progress OFF (the owner acks + relays the reply) and do NOT own the
+  // bot (im=null) — the owner owns the single WSClient.
+  let bound = false;
+  if (cfg.bind) {
+    const platform = resolveImPlatform(cfg, 'host');
+    if (!platform) die('--bind needs a logged-in IM platform — run: concord login lark --app-id <id> --app-secret <secret>');
+    const res = openBindings().bind(platform, cfg.bind, { roomId: room, chatType: null, chatName: null }, { force: cfg.force });
+    if (!res.ok) die(`chat ${cfg.bind} is already bound to room ${shortRoom(res.existing.roomId)} — add --force to rebind`);
+    bound = true;
+    const owner = reg.list().find((h) => h.mode === 'im' && h.platform === platform && h.alive);
+    console.log(`✓ bound ${platform} chat ${cfg.bind} → room ${shortRoom(room)}${owner ? '' : '\n  ⚠️ no `concord im` owner running — start it (`concord im`) so this chat actually routes.'}`);
+  }
+
+  const im = bound ? null : resolveImPlatform(cfg, mode);
   const id = newId(cfg.agent);
   const f = {
-    agent: cfg.agent, mode, room, cwd, url: cfg.url, im,
+    agent: cfg.agent, mode, room, cwd, url: cfg.url, im, bound,
     budget: cfg.budget || null, budgetWindowHours: cfg.budgetWindowHours || null,
   };
   const pid = spawnDaemon(id, f, { fg });
@@ -308,6 +327,42 @@ function logout(args) {
   console.log('✓ removed all stored credentials');
 }
 
+// `concord im` — the IM owner daemon: owns the bot's single WSClient + relays bound
+// chats. ONE per bot (single-instance). `concord im stop|status|logs` manage it.
+const imOwnerId = (platform) => `im-${platform}`;
+async function imCmd(args) {
+  const { positional } = parseArgs(args);
+  const sub = positional[0];
+  if (sub === 'stop' || sub === 'status' || sub === 'logs') {
+    const o = reg.list().find((h) => h.mode === 'im');
+    if (!o) die('no `concord im` owner is registered');
+    if (sub === 'stop') return stopHostCmd(o.id);
+    if (sub === 'status') return statusHost(o.id);
+    return logsHost(o.id, args.includes('-f') || args.includes('--follow'));
+  }
+  const cfg = resolveConfig(args, process.env);
+  const platform = resolveImPlatform(cfg, 'host');
+  if (!platform) die('no IM platform logged in — run: concord login lark --app-id <id> --app-secret <secret>');
+  const id = imOwnerId(platform);
+  const existing = reg.get(id);
+  if (existing && existing.pid && kill(existing.pid, 0)) die(`a concord im owner for ${platform} is already running (id ${id}, pid ${existing.pid}). One bot = one owner — stop it first: concord im stop`);
+  const env = { ...process.env, CONCORD_URL: cfg.url };
+  const a = [OWNER, platform];
+  if (args.includes('--fg')) {
+    reg.register({ id, mode: 'im', platform, agent: '-', room: '-' });
+    const child = spawn(process.execPath, a, { stdio: 'inherit', env });
+    reg.update(id, { pid: child.pid });
+    child.on('close', () => reg.update(id, { pid: null, stopped: true }));
+    return;
+  }
+  mkdirSync(reg.hostDir(id), { recursive: true });
+  const out = openSync(join(reg.hostDir(id), 'log'), 'a');
+  const child = spawn(process.execPath, a, { detached: true, stdio: ['ignore', out, out], env });
+  child.unref();
+  reg.register({ id, mode: 'im', platform, agent: '-', room: '-', pid: child.pid, log: join(reg.hostDir(id), 'log') });
+  console.log(`✓ im owner started — ${platform} · id ${id} · pid ${child.pid}\n  concord logs ${id}   ·   concord im stop`);
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
 // Crash-path backstop, but ONLY before mutating lifecycle commands — a read-only
 // `list`/`status`/`logs`/`help` must never have a destructive side effect. (`prune`
@@ -317,6 +372,7 @@ switch (cmd) {
   case 'join': case 'host': await startHost(cmd, rest); break;
   case 'login': await login(rest); break;
   case 'logout': logout(rest); break;
+  case 'im': await imCmd(rest); break;
   case 'list': case 'ls': listHosts(); break;
   case 'status': rest[0] ? statusHost(rest[0]) : die('usage: concord status <id>'); break;
   case 'logs': rest[0] ? logsHost(rest[0], rest.includes('-f') || rest.includes('--follow')) : die('usage: concord logs <id> [-f]'); break;

@@ -1,6 +1,6 @@
-// Tests for the IM owner's inbound dispatch (bind handshake / routing), with a mock
-// Lark client + a real binding store on a temp dir. The WSClient connect is live-only.
-// Run: node --test src/im-owner.test.mjs
+// Tests for the IM owner's inbound dispatch + relay, with a mock Lark client and a
+// mock fetch (room join/post/poll). WSClient connect + the live round-trip are
+// verified against a real Lark app. Run: node --test src/im-owner.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -15,13 +15,21 @@ function mockClient() {
     sent,
     im: { v1: { message: { create: async (req) => {
       const c = JSON.parse(req.data.content);
-      const text = req.data.msg_type === 'interactive' ? c.elements?.[0]?.content : c.text;
-      sent.push({ chatId: req.data.receive_id, msgType: req.data.msg_type, text });
+      sent.push({ chatId: req.data.receive_id, msgType: req.data.msg_type, text: req.data.msg_type === 'interactive' ? c.elements?.[0]?.content : c.text });
       return { code: 0 };
     } } } },
   };
 }
 const fakeWs = { start() {}, stop() {} };
+
+// Mock the room REST: join → a session id, POST /messages → captured, poll → empty.
+function mockFetch(captured) {
+  return async (urlStr, opts = {}) => {
+    if (urlStr.includes('/join')) return { ok: true, status: 200, json: async () => ({ agentSessionId: 'sess-1' }) };
+    if ((opts.method === 'POST') && urlStr.includes('/messages')) { captured.posts.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({}) }; }
+    return { ok: true, status: 200, json: async () => ({ messages: [] }) };   // poll
+  };
+}
 
 function ev({ text, chatType = 'p2p', mentions = null, chatId = 'oc_1', mid }) {
   return { message: { message_id: mid, chat_id: chatId, chat_type: chatType, content: JSON.stringify({ text }), mentions }, sender: { sender_id: { open_id: 'ou_x' } } };
@@ -30,9 +38,10 @@ function ev({ text, chatType = 'p2p', mentions = null, chatId = 'oc_1', mid }) {
 function freshOwner() {
   const root = mkdtempSync(join(tmpdir(), 'concord-owner-'));
   const client = mockClient();
+  const captured = { posts: [] };
   const store = openBindings(root);
-  const owner = createOwner({ platform: 'lark', log: () => {}, bindings: store, _clients: { client, ws: fakeWs } });
-  return { owner, client, store, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  const owner = createOwner({ platform: 'lark', url: 'http://test', log: () => {}, bindings: store, _clients: { client, ws: fakeWs, fetch: mockFetch(captured) } });
+  return { owner, client, store, captured, cleanup: () => { owner.shutdown(); rmSync(root, { recursive: true, force: true }); } };
 }
 
 test('/concord-bind in an UNBOUND p2p chat → prompts the host command, no --budget', async () => {
@@ -40,9 +49,8 @@ test('/concord-bind in an UNBOUND p2p chat → prompts the host command, no --bu
   try {
     const r = await owner.onEvent(ev({ text: '/concord-bind', chatType: 'p2p', chatId: 'oc_p' }));
     assert.equal(r.action, 'prompted');
-    assert.equal(client.sent.length, 1);
     assert.match(client.sent[0].text, /concord host claude --bind oc_p/);
-    assert.doesNotMatch(client.sent[0].text, /--budget/);   // p2p default = unlimited
+    assert.doesNotMatch(client.sent[0].text, /--budget/);
   } finally { cleanup(); }
 });
 
@@ -64,8 +72,8 @@ test('/concord-bind in an ALREADY-bound chat → --force prompt', async () => {
   } finally { cleanup(); }
 });
 
-test('normal message in an UNBOUND chat → "send /concord-bind"; in a BOUND chat → routed (no reply)', async () => {
-  const { owner, client, store, cleanup } = freshOwner();
+test('unbound message → "send /concord-bind"; bound message → instant ack + POST to room', async () => {
+  const { owner, client, store, captured, cleanup } = freshOwner();
   try {
     const u = await owner.onEvent(ev({ text: 'hello', chatType: 'p2p', chatId: 'oc_u' }));
     assert.equal(u.action, 'unbound');
@@ -75,8 +83,9 @@ test('normal message in an UNBOUND chat → "send /concord-bind"; in a BOUND cha
     client.sent.length = 0;
     const b = await owner.onEvent(ev({ text: 'do the thing', chatType: 'p2p', chatId: 'oc_b' }));
     assert.equal(b.action, 'routed');
-    assert.equal(b.roomId, 'room-xyz99999');
-    assert.equal(client.sent.length, 0);   // routed to room (phase 3), not answered by the owner
+    assert.match(client.sent[0].text, /收到/);                                 // owner instant ack (decision 4)
+    assert.ok(captured.posts.some((p) => /do the thing/.test(p.content)));      // posted into the bound room
+    assert.ok(captured.posts.every((p) => p.sender === 'IM'));                  // as the relay identity (loop guard)
   } finally { cleanup(); }
 });
 

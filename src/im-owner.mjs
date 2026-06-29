@@ -1,28 +1,37 @@
 // `concord im` — the IM OWNER. Owns the bot's single WSClient, holds the chat→room
-// bindings, intercepts the bind commands, and (phase 3) relays bound chats to their
-// rooms. ONE owner per bot — the single connection owner the single-tenant redesign
-// requires (multiple WSClients on one bot = Lark splits events = chaos).
+// bindings, intercepts the bind commands, and relays bound chats ↔ their Concord rooms.
+// ONE owner per bot — the single connection owner the single-tenant redesign requires
+// (multiple WSClients on one bot = Lark splits events = chaos).
 //
-// Inbound brain is pure (im-routing.classifyInbound); this wires it to the SDK.
-// `concord-bind` / `concord-unbind` are handled HERE and never reach an agent.
+//   IM chat ──/concord-bind──► owner replies the guided command IN the chat
+//   IM chat ──message───────► owner POSTs into the bound room (as "IM") + instant ack
+//   bound room ──agent reply─► owner relays it back to the IM chat (loop-guard: skip "IM")
+//
+// Inbound brain is pure (im-routing.classifyInbound); HTTP is injectable for tests.
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { watch } from 'node:fs';
 import { loadCreds } from './creds.mjs';
 import { openBindings } from './im-bindings.mjs';
 import { classifyInbound } from './im-routing.mjs';
 import { cleanText } from './im-lark.mjs';
 
 const DOMAINS = { lark: Lark.Domain.Lark, feishu: Lark.Domain.Feishu };
-const GROUP_DEFAULT_BUDGET = 1000000;   // decision: a group binding defaults to this (the only token gate once "anyone triggers")
+const GROUP_DEFAULT_BUDGET = 1000000;   // a group binding defaults to this (the only token gate once "anyone triggers")
+const RELAY_SENDER = 'IM';              // the owner's identity in each bound room; replies from anyone else are relayed back
 const short = (r) => (r ? String(r).slice(0, 8) : '-');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export function createOwner({ platform = 'lark', appId, appSecret, domain, log = console.log, bindings, _clients = null } = {}) {
+export function createOwner({ platform = 'lark', appId, appSecret, domain, url, log = console.log, bindings, _clients = null } = {}) {
   const dom = DOMAINS[domain] || DOMAINS[platform] || Lark.Domain.Lark;
   const client = _clients?.client || new Lark.Client({ appId, appSecret, domain: dom });
   const ws = _clients?.ws || new Lark.WSClient({ appId, appSecret, domain: dom, loggerLevel: Lark.LoggerLevel.warn });
+  const fetchImpl = _clients?.fetch || globalThis.fetch;
+  const CONCORD_URL = url || process.env.CONCORD_URL || 'https://concord.fenginwind.com';
   const store = bindings || openBindings();
-  const seen = new Set();   // in-process dedup (Lark resends until acked)
+  const seen = new Set();         // in-process dedup (Lark resends until acked)
+  const rooms = new Map();        // roomId → { sessionId, chatId, polling }
 
-  // Send to a chat: interactive markdown card, plain-text fallback (never silent).
+  // ---- IM side: send to a chat (interactive card, plain-text fallback) ----
   async function send(chatId, text) {
     if (!chatId || !text) return;
     const asText = () => client.im.v1.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) } });
@@ -32,8 +41,42 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, log =
     } catch (e) { log('owner card send failed → text: ' + e.message); await asText().catch((e2) => log('owner text send failed: ' + e2.message)); }
   }
 
-  // concord-bind: reply IN THE CHAT (decision 1) with a ready-to-run command. The bind
-  // itself happens when the user runs `concord host --bind <chat_id>` locally.
+  // ---- Room side: join (relay identity), post inbound, poll for agent replies ----
+  async function roomJoin(roomId) {
+    const res = await fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/join`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sender: RELAY_SENDER }) });
+    if (!res.ok) throw new Error(`relay join ${short(roomId)} failed: ${res.status}`);
+    return (await res.json()).agentSessionId;
+  }
+  async function roomPost(roomId, sessionId, content) {
+    return fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sender: RELAY_SENDER, agentSessionId: sessionId, content }) });
+  }
+  // Relay-back loop: any room message NOT from us (the agent's reply / progress / budget
+  // note) goes to the bound IM chat. Skipping RELAY_SENDER is the loop guard.
+  async function pollRoom(roomId) {
+    const rc = rooms.get(roomId);
+    while (rc && rc.polling) {
+      try {
+        const res = await fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/messages?session=${rc.sessionId}&wait=30`);
+        if (res.status === 401) { rc.sessionId = await roomJoin(roomId); continue; }
+        for (const m of (await res.json()).messages || []) {
+          if (m.sender === RELAY_SENDER) continue;          // our own injected user message → don't echo back
+          await send(rc.chatId, m.content);                 // agent reply/progress → the IM chat
+        }
+      } catch (e) { log('relay poll error: ' + e.message); await sleep(2000); }
+    }
+  }
+  async function ensureRoom(roomId, chatId) {
+    const existing = rooms.get(roomId);
+    if (existing) { existing.chatId = chatId; return existing; }
+    const sessionId = await roomJoin(roomId);
+    const rc = { sessionId, chatId, polling: true };
+    rooms.set(roomId, rc);
+    pollRoom(roomId).catch((e) => log('relay loop ended: ' + e.message));
+    log(`✓ relay up: ${platform}:${short(chatId)} ↔ room ${short(roomId)}`);
+    return rc;
+  }
+
+  // ---- bind handshake (reply IN the chat — decision 1) ----
   async function handleBind(chatId, chatType) {
     const existing = store.get(platform, chatId);
     if (existing) {
@@ -44,23 +87,23 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, log =
     await send(chatId, `本聊天(${chatType}, \`${chatId}\`)还没绑 agent。在你机器上跑:\n\`concord host claude --bind ${chatId}${budget}\`\n这会起一个 agent 并把本聊天绑给它。`);
     return { action: 'prompted', chatId, chatType };
   }
-
   async function handleUnbind(chatId) {
     const ok = store.unbind(platform, chatId);
     await send(chatId, ok ? '✓ 已解绑,本聊天不再路由到 agent。' : '本聊天当前没有绑定。');
     return { action: ok ? 'unbound' : 'not-bound' };
   }
-
-  // A normal message: route to the bound room (phase 3 does the actual relay + reply).
+  // A normal message: instant ack (decision 4), then POST into the bound room.
   async function routeMessage(chatId, text, sender) {
     const b = store.get(platform, chatId);
     if (!b) { await send(chatId, '本聊天还没绑 agent — 发 `/concord-bind` 设置。'); return { action: 'unbound' }; }
-    log(`→ route [${platform}:${short(chatId)}] → room ${short(b.roomId)} | ${sender}: ${text.slice(0, 80)}`);
-    // TODO phase 3: POST into b.roomId and relay the agent's reply back to this chat.
+    await send(chatId, '收到 👌');
+    try {
+      const rc = await ensureRoom(b.roomId, chatId);
+      await roomPost(b.roomId, rc.sessionId, `${sender}: ${text}`);
+    } catch (e) { log('route failed: ' + e.message); await send(chatId, `⚠️ 转发到 agent 失败(${String(e.message).slice(0, 80)})`); return { action: 'route-failed' }; }
     return { action: 'routed', roomId: b.roomId };
   }
 
-  // Classify one inbound event and dispatch. Returns the decision (for tests).
   async function onEvent(data) {
     const m = data?.message || {};
     const id = m.message_id;
@@ -75,17 +118,32 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, log =
     if (d.action === 'bind') return handleBind(chatId, m.chat_type);
     if (d.action === 'unbind') return handleUnbind(chatId);
     if (d.action === 'message') return routeMessage(chatId, d.text, sender);
-    return { action: d.action };   // 'ignore' | 'usage' (usage handled in phase 3)
+    return { action: d.action };   // 'ignore' | 'usage'
+  }
+
+  // Bring up relays for every current binding; rebuild on bindings-file changes so a
+  // fresh `concord host --bind` starts relaying without restarting the owner.
+  function syncRelays() {
+    const all = store.list();
+    const bound = new Set();
+    for (const b of Object.values(all)) {
+      if (b.platform !== platform) continue;
+      bound.add(b.roomId);
+      if (!rooms.has(b.roomId)) ensureRoom(b.roomId, b.chatId).catch((e) => log('relay start failed: ' + e.message));
+    }
+    for (const [roomId, rc] of rooms) if (!bound.has(roomId)) { rc.polling = false; rooms.delete(roomId); log(`relay down: room ${short(roomId)} (unbound)`); }
   }
 
   function start() {
     const dispatcher = new Lark.EventDispatcher({}).register({ 'im.message.receive_v1': (data) => onEvent(data).catch((e) => log('[owner] inbound error: ' + e.message)) });
     ws.start({ eventDispatcher: dispatcher });
+    syncRelays();                                  // join rooms for existing bindings
+    try { watch(store.path, { persistent: false }, () => { try { syncRelays(); } catch (e) { log('reload error: ' + e.message); } }); } catch { /* file may not exist yet; first bind creates it */ }
     log(`✓ concord im owner up (${platform}). Private: message the bot · Group: @ the bot · send /concord-bind to bind a chat.`);
   }
-  function shutdown() { try { ws.stop?.(); } catch { /* daemon exit closes the socket */ } }
+  function shutdown() { for (const rc of rooms.values()) rc.polling = false; try { ws.stop?.(); } catch { /* daemon exit closes the socket */ } }
 
-  return { start, send, shutdown, onEvent, handleBind, handleUnbind, routeMessage };
+  return { start, send, shutdown, onEvent, handleBind, handleUnbind, routeMessage, syncRelays };
 }
 
 // Runnable: `node src/im-owner.mjs [platform]` — load creds + start the owner.
@@ -93,7 +151,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const platform = process.argv[2] || 'lark';
   const c = loadCreds()[platform];
   if (!c?.appId || !c?.appSecret) { console.error(`✗ no ${platform} creds — run: concord login ${platform} --app-id <id> --app-secret <secret>`); process.exit(1); }
-  const owner = createOwner({ platform, appId: c.appId, appSecret: c.appSecret, domain: c.domain, log: console.log });
+  const owner = createOwner({ platform, appId: c.appId, appSecret: c.appSecret, domain: c.domain, url: process.env.CONCORD_URL, log: console.log });
   process.on('SIGTERM', () => { owner.shutdown(); process.exit(0); });
   process.on('SIGINT', () => { owner.shutdown(); process.exit(0); });
   owner.start();
