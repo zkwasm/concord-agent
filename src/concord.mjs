@@ -23,6 +23,7 @@ import { saveCreds, removeCreds, loadCreds, getCreds } from './creds.mjs';
 const IM_PLATFORMS = ['lark', 'feishu'];
 
 const SUPERVISOR = fileURLToPath(new URL('./acp-bridge.mjs', import.meta.url));
+const VERSION = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).version;
 const reg = openRegistry();
 
 const USAGE = `concord — host coding agents in Concord rooms (stdio supervisor)
@@ -45,6 +46,7 @@ Usage:
   concord budget <id> [--reset]      Show token usage / clear a budget pause
   concord resume <id>                Clear a budget pause (accept tasks again)
   concord rm <id> | prune            Stop + reclaim (if running) then remove an entry / drop dead ones
+  concord version                    Show the concord-agent version (also -v / --version)
   concord help
 
 Hosts run in the background by default (-d implied); pass --fg to stay foreground.
@@ -324,6 +326,7 @@ switch (cmd) {
   case 'prune': await prune(); break;
   case 'resume': rest[0] ? resumeHost(rest[0]) : die('usage: concord resume <id>'); break;
   case 'budget': rest[0] ? budgetCmd(rest[0], rest.slice(1)) : die('usage: concord budget <id> [--reset]'); break;
+  case 'version': case '--version': case '-v': console.log(`concord-agent ${VERSION}`); break;
   case undefined: case 'help': case '-h': case '--help': console.log(USAGE); break;
   default: console.error(`unknown command: ${cmd}\n`); console.log(USAGE); process.exit(1);
 }
