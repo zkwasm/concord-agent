@@ -44,7 +44,7 @@ Usage:
   concord restart <id>               Stop then start again with the same config
   concord budget <id> [--reset]      Show token usage / clear a budget pause
   concord resume <id>                Clear a budget pause (accept tasks again)
-  concord rm <id> | prune            Remove a stopped entry / drop dead ones
+  concord rm <id> | prune            Stop + reclaim (if running) then remove an entry / drop dead ones
   concord help
 
 Hosts run in the background by default (-d implied); pass --fg to stay foreground.
@@ -227,6 +227,20 @@ async function stopHostCmd(id, { silent } = {}) {
   if (!silent) console.log(`✓ stopped ${id} — reclaim: ${steps.join(' → ') || '(none)'}`);
 }
 
+// rm = ALWAYS reclaim the whole tree first, THEN forget. Even a seemingly-dead entry
+// is reclaimed (stopHost double-targets the bridge AND the adapter group, identity-
+// guarded), so `concord rm` on a running/orphaned host can never leave an adapter+agent
+// group alive burning tokens or memory. Guarantee: rm never produces an orphan. The
+// old rm just unregistered + deleted state, which orphaned a live group AND threw away
+// the pids needed to ever reap it.
+async function rmHost(id) {
+  const h = reg.get(id);
+  if (!h) die(`no such host: ${id}`);
+  await stopHostCmd(id, { silent: true });   // SIGTERM bridge + reap adapter group BEFORE we drop the pids/state
+  reg.unregister(id, { removeState: true });
+  console.log(`✓ removed ${id} (stopped + reclaimed first — no orphans)`);
+}
+
 async function restartHost(id) {
   const h = reg.get(id);
   if (!h) die(`no such host: ${id}`);
@@ -306,7 +320,7 @@ switch (cmd) {
   case 'logs': rest[0] ? logsHost(rest[0], rest.includes('-f') || rest.includes('--follow')) : die('usage: concord logs <id> [-f]'); break;
   case 'stop': rest[0] ? await stopHostCmd(rest[0]) : die('usage: concord stop <id>'); break;
   case 'restart': rest[0] ? await restartHost(rest[0]) : die('usage: concord restart <id>'); break;
-  case 'rm': rest[0] ? (reg.unregister(rest[0], { removeState: true }), console.log(`✓ removed ${rest[0]}`)) : die('usage: concord rm <id>'); break;
+  case 'rm': rest[0] ? await rmHost(rest[0]) : die('usage: concord rm <id>'); break;
   case 'prune': await prune(); break;
   case 'resume': rest[0] ? resumeHost(rest[0]) : die('usage: concord resume <id>'); break;
   case 'budget': rest[0] ? budgetCmd(rest[0], rest.slice(1)) : die('usage: concord budget <id> [--reset]'); break;
