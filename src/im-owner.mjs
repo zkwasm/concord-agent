@@ -43,24 +43,30 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   }
 
   // ---- Room side: join (relay identity), post inbound, poll for agent replies ----
+  // Join as "IM"; if that name is taken in the room (409 — e.g. a previous owner's
+  // session lingers after a restart), retry with a pid-suffixed name. Returns the
+  // session AND the name we actually joined as (the loop guard keys on it).
   async function roomJoin(roomId) {
-    const res = await fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/join`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sender: RELAY_SENDER }) });
-    if (!res.ok) throw new Error(`relay join ${short(roomId)} failed: ${res.status}`);
-    return (await res.json()).agentSessionId;
+    for (const name of [RELAY_SENDER, `${RELAY_SENDER}-${process.pid % 10000}`]) {
+      const res = await fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/join`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sender: name }) });
+      if (res.ok) return { sessionId: (await res.json()).agentSessionId, sender: name };
+      if (res.status !== 409) throw new Error(`relay join ${short(roomId)} failed: ${res.status}`);
+    }
+    throw new Error(`relay join ${short(roomId)}: relay name taken`);
   }
-  async function roomPost(roomId, sessionId, content) {
-    return fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sender: RELAY_SENDER, agentSessionId: sessionId, content }) });
+  async function roomPost(roomId, sessionId, sender, content) {
+    return fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sender, agentSessionId: sessionId, content }) });
   }
   // Relay-back loop: any room message NOT from us (the agent's reply / progress / budget
-  // note) goes to the bound IM chat. Skipping RELAY_SENDER is the loop guard.
+  // note) goes to the bound IM chat. Skipping our own relay sender is the loop guard.
   async function pollRoom(roomId) {
     const rc = rooms.get(roomId);
     while (rc && rc.polling) {
       try {
         const res = await fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/messages?session=${rc.sessionId}&wait=30`);
-        if (res.status === 401) { rc.sessionId = await roomJoin(roomId); continue; }
+        if (res.status === 401) { const j = await roomJoin(roomId); rc.sessionId = j.sessionId; rc.relaySender = j.sender; continue; }
         for (const m of (await res.json()).messages || []) {
-          if (m.sender === RELAY_SENDER) continue;          // our own injected user message → don't echo back
+          if (m.sender === rc.relaySender) continue;        // our own injected user message → don't echo back
           await send(rc.chatId, m.content);                 // agent reply/progress → the IM chat
         }
       } catch (e) { log('relay poll error: ' + e.message); await sleep(2000); }
@@ -69,11 +75,11 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   async function ensureRoom(roomId, chatId) {
     const existing = rooms.get(roomId);
     if (existing) { existing.chatId = chatId; return existing; }
-    const sessionId = await roomJoin(roomId);
-    const rc = { sessionId, chatId, polling: true };
+    const { sessionId, sender } = await roomJoin(roomId);
+    const rc = { sessionId, chatId, relaySender: sender, polling: true };
     rooms.set(roomId, rc);
     pollRoom(roomId).catch((e) => log('relay loop ended: ' + e.message));
-    log(`✓ relay up: ${platform}:${short(chatId)} ↔ room ${short(roomId)}`);
+    log(`✓ relay up: ${platform}:${short(chatId)} ↔ room ${short(roomId)} (as ${sender})`);
     return rc;
   }
 
@@ -100,7 +106,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     await send(chatId, '收到 👌');
     try {
       const rc = await ensureRoom(b.roomId, chatId);
-      await roomPost(b.roomId, rc.sessionId, `${sender}: ${text}`);
+      await roomPost(b.roomId, rc.sessionId, rc.relaySender, `${sender}: ${text}`);
     } catch (e) { log('route failed: ' + e.message); await send(chatId, `⚠️ 转发到 agent 失败(${String(e.message).slice(0, 80)})`); return { action: 'route-failed' }; }
     return { action: 'routed', roomId: b.roomId };
   }
