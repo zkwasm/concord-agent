@@ -10,6 +10,7 @@
 // Inbound brain is pure (im-routing.classifyInbound); HTTP is injectable for tests.
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { watch } from 'node:fs';
+import { dirname } from 'node:path';
 import { loadCreds } from './creds.mjs';
 import { openBindings } from './im-bindings.mjs';
 import { classifyInbound } from './im-routing.mjs';
@@ -123,13 +124,23 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
 
   // Bring up relays for every current binding; rebuild on bindings-file changes so a
   // fresh `concord host --bind` starts relaying without restarting the owner.
-  function syncRelays() {
+  // Bring up relays for every current binding. `notify` → confirm IN the chat when a
+  // NEW binding is picked up (so the user who just ran `concord host --bind` sees it
+  // worked) — silent on the owner's own startup so a restart never spams existing chats.
+  async function syncRelays({ notify = false } = {}) {
     const all = store.list();
     const bound = new Set();
     for (const b of Object.values(all)) {
       if (b.platform !== platform) continue;
       bound.add(b.roomId);
-      if (!rooms.has(b.roomId)) ensureRoom(b.roomId, b.chatId).catch((e) => log('relay start failed: ' + e.message));
+      if (rooms.has(b.roomId)) continue;
+      try {
+        await ensureRoom(b.roomId, b.chatId);
+        if (notify) await send(b.chatId, '✓ 绑定成功,agent 已就位 —— 直接发任务给我吧。');
+      } catch (e) {
+        log('relay start failed: ' + e.message);
+        if (notify) await send(b.chatId, `⚠️ 绑定失败:连不上房间(${String(e.message).slice(0, 80)})。`);
+      }
     }
     for (const [roomId, rc] of rooms) if (!bound.has(roomId)) { rc.polling = false; rooms.delete(roomId); log(`relay down: room ${short(roomId)} (unbound)`); }
   }
@@ -137,8 +148,16 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   function start() {
     const dispatcher = new Lark.EventDispatcher({}).register({ 'im.message.receive_v1': (data) => onEvent(data).catch((e) => log('[owner] inbound error: ' + e.message)) });
     ws.start({ eventDispatcher: dispatcher });
-    syncRelays();                                  // join rooms for existing bindings
-    try { watch(store.path, { persistent: false }, () => { try { syncRelays(); } catch (e) { log('reload error: ' + e.message); } }); } catch { /* file may not exist yet; first bind creates it */ }
+    syncRelays({ notify: false }).catch((e) => log('initial sync error: ' + e.message));   // existing bindings — silent
+    // Watch the DIRECTORY (the bindings file may not exist yet at startup), debounced —
+    // a fresh `concord host --bind` then brings the relay up AND confirms in the chat.
+    let deb;
+    try {
+      watch(dirname(store.path), { persistent: false }, (_e, fn) => {
+        if (fn && fn !== 'im-bindings.json') return;
+        clearTimeout(deb); deb = setTimeout(() => syncRelays({ notify: true }).catch((e) => log('reload error: ' + e.message)), 200);
+      });
+    } catch (e) { log('bindings watch unavailable: ' + e.message); }
     log(`✓ concord im owner up (${platform}). Private: message the bot · Group: @ the bot · send /concord-bind to bind a chat.`);
   }
   function shutdown() { for (const rc of rooms.values()) rc.polling = false; try { ws.stop?.(); } catch { /* daemon exit closes the socket */ } }

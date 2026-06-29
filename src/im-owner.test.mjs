@@ -103,6 +103,18 @@ test('group message without @ is ignored; /concord-unbind removes a binding', as
   } finally { cleanup(); }
 });
 
+test('syncRelays({notify:true}) joins a new binding and confirms "✓ 绑定成功" in the chat, once', async () => {
+  const { owner, client, store, cleanup } = freshOwner();
+  try {
+    store.bind('lark', 'oc_new', { roomId: 'room-new12345' });
+    await owner.syncRelays({ notify: true });
+    assert.ok(client.sent.some((s) => /绑定成功/.test(s.text)));
+    client.sent.length = 0;
+    await owner.syncRelays({ notify: true });                              // already joined → no re-notify
+    assert.equal(client.sent.filter((s) => /绑定成功/.test(s.text)).length, 0);
+  } finally { cleanup(); }
+});
+
 test('duplicate message_id is dropped (Lark redelivery)', async () => {
   const { owner, cleanup } = freshOwner();
   try {
