@@ -55,6 +55,28 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     return name;
   }
 
+  // Is this group effectively a private channel — one human besides the bot? Lark's
+  // chat.get returns user_count (humans) apart from bot_count, so `user_count <= 1` is
+  // unambiguous. Cached briefly so we don't query chat.get on every un-@ chit-chat line;
+  // the TTL also lets a group that gains a 2nd person revert to @-only within a minute.
+  // Needs the im:chat:readonly scope — without it chat.get throws and we stay @-only.
+  const soloCache = new Map();   // chatId → { solo, at }
+  const SOLO_TTL = 60000;
+  async function isSoloGroup(chatId) {
+    const c = soloCache.get(chatId);
+    const now = Date.now();
+    if (c && now - c.at < SOLO_TTL) return c.solo;
+    let solo = false;
+    try {
+      const r = await client.im.v1.chat.get({ path: { chat_id: chatId } });
+      const users = Number(r?.data?.user_count);
+      if (Number.isFinite(users)) solo = users <= 1;
+      log(`[owner] solo-check ${short(chatId)}: user_count=${r?.data?.user_count} → ${solo ? 'solo (no @ needed)' : 'shared (@ required)'}`);
+    } catch (e) { log('solo-group check failed (grant im:chat:readonly?): ' + e.message); }
+    soloCache.set(chatId, { solo, at: now });
+    return solo;
+  }
+
   // The CONCORD ROOM's name (not the Lark chat's), via the agent REST /info endpoint —
   // so the intro / /agents say which room the chat is bound to. The room id is itself
   // the bearer, so a bare GET suffices. Cached, best-effort.
@@ -169,8 +191,12 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     if (id) seen.add(id);
     let raw = ''; try { raw = JSON.parse(m.content || '{}').text || ''; } catch { /* non-text */ }
     const text = cleanText(raw, m.mentions);
-    const d = classifyInbound({ text, chatType: m.chat_type, mentions: m.mentions });
     const chatId = m.chat_id;
+    // A group with just one human is the user's own bot-control channel (the only way to
+    // get a "private" chat with the bot is to make such a group) → drop the @ requirement.
+    const unAtGroup = m.chat_type === 'group' && !(Array.isArray(m.mentions) && m.mentions.length > 0);
+    const soloGroup = unAtGroup ? await isSoloGroup(chatId) : false;
+    const d = classifyInbound({ text, chatType: m.chat_type, mentions: m.mentions, soloGroup });
     log(`[owner] ${m.chat_type} ${short(chatId)} text=${JSON.stringify(text.slice(0, 40))} → ${d.action}`);
     if (d.action === 'bind') return handleBind(chatId, m.chat_type);
     if (d.action === 'unbind') return handleUnbind(chatId);

@@ -21,6 +21,13 @@ test('group: only when the bot is @-mentioned', () => {
   assert.deepEqual(classifyInbound({ text: '@bot 跑测试', chatType: 'group', mentions: [{ key: '@_user_1' }] }), { action: 'message', text: '@bot 跑测试' });
 });
 
+test('solo group (one human + bot): acts without an @, like p2p', () => {
+  assert.deepEqual(classifyInbound({ text: '跑测试', chatType: 'group', mentions: [], soloGroup: true }), { action: 'message', text: '跑测试' });
+  assert.equal(classifyInbound({ text: '/concord-bind', chatType: 'group', mentions: [], soloGroup: true }).action, 'bind');
+  // a shared group with the same un-@ message is still ignored
+  assert.equal(classifyInbound({ text: '跑测试', chatType: 'group', mentions: [], soloGroup: false }).action, 'ignore');
+});
+
 test('bind / unbind: /concord-bind canonical + bare accepted, in p2p and group', () => {
   // canonical slash form (reads as a command, @bot stripped in groups)
   assert.equal(classifyInbound({ text: '/concord-bind', chatType: 'p2p' }).action, 'bind');

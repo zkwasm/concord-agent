@@ -9,15 +9,18 @@ import { join } from 'node:path';
 import { openBindings } from './im-bindings.mjs';
 import { createOwner } from './im-owner.mjs';
 
-function mockClient() {
+function mockClient({ userCount = 5 } = {}) {
   const sent = [];
   return {
     sent,
-    im: { v1: { message: { create: async (req) => {
-      const c = JSON.parse(req.data.content);
-      sent.push({ chatId: req.data.receive_id, msgType: req.data.msg_type, text: req.data.msg_type === 'interactive' ? c.elements?.[0]?.content : c.text });
-      return { code: 0 };
-    } } } },
+    im: { v1: {
+      message: { create: async (req) => {
+        const c = JSON.parse(req.data.content);
+        sent.push({ chatId: req.data.receive_id, msgType: req.data.msg_type, text: req.data.msg_type === 'interactive' ? c.elements?.[0]?.content : c.text });
+        return { code: 0 };
+      } },
+      chat: { get: async () => ({ data: { user_count: String(userCount), bot_count: '1' } }) },   // member count for solo-group detection
+    } },
   };
 }
 const fakeWs = { start() {}, stop() {} };
@@ -35,9 +38,9 @@ function ev({ text, chatType = 'p2p', mentions = null, chatId = 'oc_1', mid }) {
   return { message: { message_id: mid, chat_id: chatId, chat_type: chatType, content: JSON.stringify({ text }), mentions }, sender: { sender_id: { open_id: 'ou_x' } } };
 }
 
-function freshOwner() {
+function freshOwner({ userCount } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'concord-owner-'));
-  const client = mockClient();
+  const client = mockClient({ userCount });
   const captured = { posts: [] };
   const store = openBindings(root);
   const owner = createOwner({ platform: 'lark', url: 'http://test', log: () => {}, bindings: store, _clients: { client, ws: fakeWs, fetch: mockFetch(captured) } });
@@ -100,6 +103,27 @@ test('group message without @ is ignored; /concord-unbind removes a binding', as
     const r = await owner.onEvent(ev({ text: '@bot /concord-unbind', chatType: 'group', mentions: [{ key: '@_u' }], chatId: 'oc_g' }));
     assert.equal(r.action, 'unbound');
     assert.equal(store.get('lark', 'oc_g'), null);
+  } finally { cleanup(); }
+});
+
+test('solo group (user_count=1): un-@ message is routed, like p2p', async () => {
+  const { owner, client, store, captured, cleanup } = freshOwner({ userCount: 1 });
+  try {
+    store.bind('lark', 'oc_solo', { roomId: 'room-solo1234' });
+    const r = await owner.onEvent(ev({ text: 'run the build', chatType: 'group', mentions: [], chatId: 'oc_solo' }));
+    assert.equal(r.action, 'routed');
+    assert.match(client.sent[0].text, /收到/);
+    assert.ok(captured.posts.some((p) => /run the build/.test(p.content)));
+  } finally { cleanup(); }
+});
+
+test('shared group (user_count=3): un-@ message is still ignored', async () => {
+  const { owner, client, store, cleanup } = freshOwner({ userCount: 3 });
+  try {
+    store.bind('lark', 'oc_shared', { roomId: 'room-shared99' });
+    const r = await owner.onEvent(ev({ text: 'chit chat', chatType: 'group', mentions: [], chatId: 'oc_shared' }));
+    assert.equal(r.action, 'ignore');
+    assert.equal(client.sent.length, 0);
   } finally { cleanup(); }
 });
 

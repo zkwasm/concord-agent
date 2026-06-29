@@ -19,14 +19,15 @@ const AGENTS = new Set(['/agents', 'agents']);
 
 // Decide what the owner should do with one inbound message.
 //   chatType: 'p2p' | 'group'        mentions: Lark mentions array (group @ signal)
-// Routing rule: p2p → always act; group → only when the bot is @-mentioned. Commands
-// are matched on the mention-stripped text so the leading @bot in a group is ignored.
-// Returns { action: 'ignore'|'bind'|'unbind'|'usage'|'message', text?, reason? }.
-export function classifyInbound({ text, chatType, mentions } = {}) {
+//   soloGroup: the group holds one human + the bot → treat like p2p (no @ needed)
+// Routing rule: p2p (or a solo group) → always act; a shared group → only when the bot
+// is @-mentioned. Commands are matched on the mention-stripped text so a leading @bot is
+// ignored. Returns { action: 'ignore'|'bind'|'unbind'|'usage'|'message', text?, reason? }.
+export function classifyInbound({ text, chatType, mentions, soloGroup = false } = {}) {
   const clean = String(text || '').trim();
   if (!clean) return { action: 'ignore', reason: 'empty' };
-  const atBot = chatType === 'p2p' || (Array.isArray(mentions) && mentions.length > 0);
-  if (!atBot) return { action: 'ignore', reason: 'group-no-at' };   // group message that didn't @ the bot
+  const atBot = chatType === 'p2p' || soloGroup || (Array.isArray(mentions) && mentions.length > 0);
+  if (!atBot) return { action: 'ignore', reason: 'group-no-at' };   // shared group message that didn't @ the bot
   const cmd = commandOf(clean);
   if (BIND.has(cmd)) return { action: 'bind' };
   if (UNBIND.has(cmd)) return { action: 'unbind' };
