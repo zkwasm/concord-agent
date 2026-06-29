@@ -89,7 +89,10 @@ function resolveImPlatform(cfg, mode) {
 }
 
 function spawnDaemon(id, f, { fg }) {
-  const env = { ...process.env, STORE_PATH: reg.statePath(id), ACP_PROGRESS: f.bound ? '0' : (f.mode === 'host' ? '1' : '0'), ACP_IM: f.im || '' };
+  // host (incl. --bind) → progress ON so the IM chat sees the agent working, not just the
+  // final reply; join (web/multi-agent) → OFF. A bound host posts progress to the ROOM and
+  // the `concord im` owner relays it on (im=null here — the owner owns the single bot conn).
+  const env = { ...process.env, STORE_PATH: reg.statePath(id), ACP_PROGRESS: f.mode === 'host' ? '1' : '0', ACP_IM: f.im || '' };
   const supArgs = buildSupArgs(f);
   if (fg) {
     reg.register({ id, ...f });
@@ -123,8 +126,8 @@ async function startHost(mode, args) {
   if (!room) { room = await obtainRoomId(cfg.publicUrl || cfg.url); console.log('  → room connected.'); }
 
   // --bind: record a chat→room binding so the `concord im` owner relays this chat here.
-  // Bound agents run progress OFF (the owner acks + relays the reply) and do NOT own the
-  // bot (im=null) — the owner owns the single WSClient.
+  // Bound agents run progress ON (the owner relays the progress + reply from the room) and
+  // do NOT own the bot (im=null) — the owner owns the single WSClient.
   let bound = false;
   if (cfg.bind) {
     const platform = resolveImPlatform(cfg, 'host');
