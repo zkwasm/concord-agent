@@ -21,6 +21,7 @@ export function openBrowser(url) {
 export function obtainRoomId(publicUrl, { log = console.log } = {}) {
   const nonce = randomUUID();
   return new Promise((resolve, reject) => {
+    let timer;
     const server = createServer((req, res) => {
       const q = new URL(req.url, 'http://127.0.0.1').searchParams;
       if (q.get('nonce') !== nonce) { res.writeHead(403).end('bad nonce'); return; }   // reject forged callbacks
@@ -29,9 +30,10 @@ export function obtainRoomId(publicUrl, { log = console.log } = {}) {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end('<!doctype html><meta charset=utf-8><body style="font-family:sans-serif;background:#0d1117;color:#e6edf3;display:flex;min-height:100vh;align-items:center;justify-content:center"><div>✓ Room connected. Close this tab and return to the terminal.</div></body>');
       server.close();
+      clearTimeout(timer);          // got the room → cancel the watchdog so it can't keep the CLI alive (the "hangs after selecting" bug)
       resolve(roomId);
     });
-    server.on('error', reject);
+    server.on('error', (e) => { clearTimeout(timer); reject(e); });
     server.listen(0, '127.0.0.1', () => {
       const cb = `http://127.0.0.1:${server.address().port}/cb?nonce=${nonce}`;
       const url = `${publicUrl}/im/connect?cli=${encodeURIComponent(cb)}`;
@@ -40,6 +42,7 @@ export function obtainRoomId(publicUrl, { log = console.log } = {}) {
       log("  (If it doesn't open, paste that URL into your browser.)\n");
       openBrowser(url);
     });
-    setTimeout(() => { server.close(); reject(new Error('timed out waiting for room selection (5 min)')); }, 5 * 60 * 1000);
+    timer = setTimeout(() => { server.close(); reject(new Error('timed out waiting for room selection (5 min)')); }, 5 * 60 * 1000);
+    timer.unref();   // belt-and-suspenders: even if never cleared, the watchdog must never block process exit
   });
 }
