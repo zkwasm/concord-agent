@@ -63,6 +63,7 @@ export function resolveConfig(argv, env = {}) {
     effort: pick('effort', 'AGENT_EFFORT', ''),
     budget: pick('budget', 'AGENT_TOKEN_BUDGET', null),                       // max fresh tokens / window; null = unlimited
     budgetWindowHours: pick('budget-window-hours', 'AGENT_BUDGET_WINDOW_HOURS', null), // rolling window, default 24h
+    im: pick('im', 'ACP_IM', null),                                          // 'lark' | 'feishu' — bridge this host's room to your IM bot
     // progress is tri-state: true (--progress) / false (--no-progress) / null (use mode default: host=on, join=off)
     progress: flags.progress === true ? true : (flags['no-progress'] === true ? false : (env.ACP_PROGRESS != null ? env.ACP_PROGRESS === '1' : null)),
   };

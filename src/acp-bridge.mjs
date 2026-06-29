@@ -108,6 +108,38 @@ async function joinRoom() {
 const sendToRoom = (text) => post('/messages', { sender: senderName, agentSessionId: sessionId, content: text });
 
 // ---------------------------------------------------------------------------
+// IM bridge (personal mode) — only when `concord host --im <platform>` set. Lazy so a
+// room-only host (join / host without IM) never loads the Lark SDK. 1:1: this host's
+// room <-> the user's own bot. Inbound IM → fed to the turn queue; replies/progress go
+// back to the originating chat AND the room (record).
+// ---------------------------------------------------------------------------
+const IM_PLATFORM = process.env.ACP_IM || '';
+let im = null;                 // { send(chatId,text), shutdown() } or null
+let currentImChat = null;      // the IM chat the in-flight turn came from (reply target)
+
+// Deliver a user-facing line to the room AND, when the active turn came from IM, back to
+// that chat. With no IM this is exactly sendToRoom → room-only behavior is unchanged.
+function out(text, imChat = currentImChat) {
+  const p = sendToRoom(text);
+  if (im && imChat) im.send(imChat, text).catch(() => {});
+  return p;
+}
+
+async function startIm() {
+  if (!IM_PLATFORM) return;
+  const { getCreds } = await import('./creds.mjs');
+  const c = getCreds(IM_PLATFORM);
+  if (!c?.appId || !c?.appSecret) { console.warn(`⚠️ --im ${IM_PLATFORM} set but no stored creds — running room-only.`); return; }
+  const { createImBridge } = await import('./im-lark.mjs');
+  im = createImBridge({ platform: IM_PLATFORM, appId: c.appId, appSecret: c.appSecret, domain: c.domain, log: console.log });
+  im.start({
+    isSeen: (mid) => store.wasProcessedInbound('im:' + mid),
+    markSeen: (mid) => store.markProcessedInbound('im:' + mid),
+    onMessage: ({ chatId, text, sender }) => handleInbound({ text, sender, imChat: chatId }),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Agent side: one prompt turn per room message, against the resident ACP session
 // ---------------------------------------------------------------------------
 let busy = false;
@@ -174,7 +206,7 @@ async function runTurn(text) {
     if (!st.emitted && (toolDetail(uu) || completed)) {   // emit enriched once; fallback to bare card on completion
       const card = toolToProgress(uu);
       console.log(`  ${card}`);                      // local log always
-      if (PROGRESS) sendToRoom(card);                // room card only when progress is on (off in multi-agent join)
+      if (PROGRESS) out(card);                        // room (+ IM chat of the active turn) when progress is on
       st.emitted = true;
     }
     toolState.set(id, st);
@@ -184,7 +216,7 @@ async function runTurn(text) {
     usageWarned = true;   // a set --budget that can't be measured must NOT silently become unlimited.
     const w = `⚠️ 这个 agent 不上报 token 用量,设定的 --budget(${AGENT_TOKEN_BUDGET})无法按量强制执行;仅靠单轮超时兜底单轮上界。`;
     console.warn(w);
-    sendToRoom(w).catch(() => {});   // safety-relevant fact → post regardless of PROGRESS (like turn-fail notes)
+    out(w);   // safety-relevant fact → room + IM, regardless of PROGRESS (like turn-fail notes)
   }
   console.log(`■ turn end  ·  stop=${stopReason}  ·  fresh ${usage.fresh} tok, cache-read ${usage.cached} tok`);
   return { reply, usage };
@@ -196,7 +228,7 @@ function budgetBlocked(now) {
   if (windowElapsed(store.getUsage(CONCORD_ROOM_ID).windowStart, now, BUDGET_WINDOW_MS)) { store.resetUsage(CONCORD_ROOM_ID, now); warned80 = false; }
   return overBudget(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET);
 }
-const budgetNote = () => sendToRoom(budgetExceededNote(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET, BUDGET_WINDOW_HOURS));
+const budgetNote = (imChat) => out(budgetExceededNote(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET, BUDGET_WINDOW_HOURS), imChat);
 
 // Early-warning so spend is VISIBLE before the cap pauses the agent: one room note
 // when usage first crosses 80% of the budget this window. No-op if no budget.
@@ -205,7 +237,7 @@ function maybeBudgetWarn() {
   const u = store.getUsage(CONCORD_ROOM_ID);
   if (u.fresh >= AGENT_TOKEN_BUDGET * 0.8) {
     warned80 = true;
-    sendToRoom(`⚠️ 已用 ${u.fresh}/${AGENT_TOKEN_BUDGET} fresh tok(≥80%),接近本窗口预算上限。`).catch(() => {});
+    out(`⚠️ 已用 ${u.fresh}/${AGENT_TOKEN_BUDGET} fresh tok(≥80%),接近本窗口预算上限。`);
   }
 }
 
@@ -215,22 +247,24 @@ async function drain() {
   try {
     while (pending.length) {
       if (paused) { pending.length = 0; break; }
-      if (budgetBlocked(Date.now())) { await budgetNote(); pending.length = 0; break; } // drop queued; over budget
+      const item = pending[0];                                 // peek: reply/notes target THIS message's IM chat
+      if (budgetBlocked(Date.now())) { await budgetNote(item.imChat); pending.length = 0; break; } // drop queued; over budget
       // Self-heal: a dead engine (adapter crash / dropped connection) is rebuilt
-      // before the turn. If it won't come back, tell the room and stop draining;
+      // before the turn. If it won't come back, tell the user and stop draining;
       // the next inbound message retries (poll waits 30s → no tight crash loop).
       if (!engine || engine.dead()) {
         try { await ensureEngine(); }
-        catch (e) { console.error('engine restart failed:', e.message); await sendToRoom(`⚠️ agent 暂时起不来(${String(e.message).slice(0, 120)}),稍后再发一次。`).catch(() => {}); break; }
+        catch (e) { console.error('engine restart failed:', e.message); await out(`⚠️ agent 暂时起不来(${String(e.message).slice(0, 120)}),稍后再发一次。`, item.imChat).catch(() => {}); break; }
       }
-      const msg = pending.shift();
-      console.log(`\n▶ turn start  ·  ${msg.slice(0, 80)}`);
+      pending.shift();
+      currentImChat = item.imChat;                             // route this turn's progress + reply to its IM chat (if any)
+      console.log(`\n▶ turn start  ·  ${item.text.slice(0, 80)}`);
       try {
-        const { reply, usage } = await runTurn(msg);
+        const { reply, usage } = await runTurn(item.text);
         recreateTimes = [];                                    // a clean turn means the engine recovered → reset the crash-loop guard
         store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached, Date.now());
         maybeBudgetWarn();                                     // surface 80%-of-budget before the cap pauses us
-        if (reply.trim()) await sendToRoom(reply.trim());      // agent's full reply -> room
+        if (reply.trim()) await out(reply.trim());             // agent's full reply -> room + IM chat
       } catch (e) {
         // A mid-turn ACP failure must NOT crash the host (the #1 review finding).
         // Surface it and keep the bridge alive; the next iteration rebuilds the engine.
@@ -245,18 +279,38 @@ async function drain() {
           timeoutTimes.push(now);
           if (timeoutTimes.length >= MAX_TIMEOUTS_WINDOW) {
             paused = true; pending.length = 0;
-            await sendToRoom(`⏸️ 多次超时(${MAX_TIMEOUTS_WINDOW} 次),已暂停以免持续烧 token。用 \`concord list\` 找到 id 后 \`concord resume <id>\` 或 \`concord restart <id>\`。`).catch(() => {});
+            await out(`⏸️ 多次超时(${MAX_TIMEOUTS_WINDOW} 次),已暂停以免持续烧 token。用 \`concord list\` 找到 id 后 \`concord resume <id>\` 或 \`concord restart <id>\`。`).catch(() => {});
             break;
           }
-          await sendToRoom(`⚠️ 这轮超时被取消了(${String(e.message).slice(0, 100)})。任务太大就拆小一点再发。`).catch(() => {});
+          await out(`⚠️ 这轮超时被取消了(${String(e.message).slice(0, 100)})。任务太大就拆小一点再发。`).catch(() => {});
         } else {
-          await sendToRoom(`⚠️ 这条没处理成功(${String(e.message).slice(0, 120)}),可以再发一次。`).catch(() => {});
+          await out(`⚠️ 这条没处理成功(${String(e.message).slice(0, 120)}),可以再发一次。`).catch(() => {});
         }
+      } finally {
+        currentImChat = null;
       }
     }
   } finally {
     busy = false;   // ALWAYS reset, so a failure can't wedge the host busy forever
   }
+}
+
+// One inbound message (from the room poll OR the IM bridge) → maybe ack/intro, then
+// queue a turn. imChat = the IM chat to reply into (null for a Concord-room message).
+async function handleInbound({ text, sender, imChat = null }) {
+  const content = (text || '').trim();
+  if (!content) return;
+  if (['/usage', '/stats', '用量'].includes(content)) {       // pure query — no turn, no ack
+    await out(usageReport(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET, BUDGET_WINDOW_HOURS), imChat);
+    return;
+  }
+  if (paused) { if (im && imChat) im.send(imChat, '⏸️ 已暂停(多次超时);让 owner 跑 `concord resume`/`restart` 后再发。').catch(() => {}); return; }
+  if (budgetBlocked(Date.now())) { await budgetNote(imChat); return; }   // over budget → refuse cleanly
+  if (PROGRESS && !store.wasIntroduced(CONCORD_ROOM_ID)) { await out(introText(), imChat); store.setIntroduced(CONCORD_ROOM_ID); }
+  if (PROGRESS) await out(nextAck(), imChat);                  // instant "收到" before the agent works
+  console.log(`→ agent | ${sender}: ${content}`);
+  pending.push({ text: `[${sender}] ${content}`, imChat });
+  drain();
 }
 
 // ---------------------------------------------------------------------------
@@ -272,22 +326,8 @@ async function pollLoop() {
         if (m.sender === senderName) continue;
         if (store.wasProcessedInbound(m.id)) continue;   // already handled (resume / redelivery)
         store.markProcessedInbound(m.id);
-        // Stats query — pure program, no LLM turn, no ack.
-        if (['/usage', '/stats', '用量'].includes((m.content || '').trim())) {
-          await sendToRoom(usageReport(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET, BUDGET_WINDOW_HOURS));
-          continue;
-        }
-        // Paused after repeated timeouts → don't enqueue (would just burn again).
-        if (paused) continue;
-        // Already over budget when a task arrives → refuse cleanly (no false ack).
-        if (budgetBlocked(Date.now())) { await budgetNote(); continue; }
-        // First time someone talks to us in this room: introduce ourselves. (host only.)
-        if (PROGRESS && !store.wasIntroduced(CONCORD_ROOM_ID)) { await sendToRoom(introText()); store.setIntroduced(CONCORD_ROOM_ID); }
-        if (PROGRESS) await sendToRoom(nextAck());          // instant "收到" before the agent works (host only)
-        console.log(`Concord → agent | ${m.sender}: ${m.content}`);
-        pending.push(`[${m.sender}] ${m.content}`);
+        await handleInbound({ text: m.content, sender: m.sender, imChat: null });   // room message → reply to room only
       }
-      drain();
       if (++n % 10 === 0) await post('/heartbeat', { agentSessionId: sessionId });
     } catch (e) { console.error('poll error:', e.message); await new Promise((r) => setTimeout(r, 2000)); }
   }
@@ -303,6 +343,7 @@ async function cleanShutdown(sig) {
   // AWAIT the group-kill: engine.shutdown() group-SIGTERMs the adapter, waits for
   // the group to actually exit, then group-SIGKILLs. We only exit AFTER it's gone —
   // the SIGKILL backstop must not live in a process that exits before it fires.
+  try { im?.shutdown(); } catch { /* best effort */ }
   try { if (engine) await engine.shutdown(); } catch { /* best effort */ }
   store.setAdapterPid(null);   // group reaped → clear the pgid so the CLI doesn't re-reap a dead pid
   process.exit(0);
@@ -319,6 +360,7 @@ process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); war
 
 await joinRoom();
 try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}`); }
-console.log(`✓ acp-bridge up. Driving "${AGENT}" over ACP in ${AGENT_CWD} (progress=${PROGRESS ? 'on' : 'off'}, permission=${PERMISSION_POLICY}).`);
-console.log(`  Idle = room long-poll + agent idle. Send a room message to wake it.`);
+try { await startIm(); } catch (e) { console.warn('IM bridge failed to start (room-only): ' + (e?.message || e)); }
+console.log(`✓ acp-bridge up. Driving "${AGENT}" over ACP in ${AGENT_CWD} (progress=${PROGRESS ? 'on' : 'off'}, permission=${PERMISSION_POLICY}${IM_PLATFORM ? `, im=${IM_PLATFORM}` : ''}).`);
+console.log(`  Idle = room long-poll + agent idle. Send a room${IM_PLATFORM ? `/IM` : ''} message to wake it.`);
 pollLoop();

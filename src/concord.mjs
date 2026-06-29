@@ -18,7 +18,9 @@ import { resolveConfig, parseArgs } from './cli.mjs';
 import { openRegistry, newId } from './hosts.mjs';
 import { stopHost, reapAdapterGroup, procStart } from './reclaim.mjs';
 import { obtainRoomId } from './handoff.mjs';
-import { saveCreds, removeCreds, loadCreds } from './creds.mjs';
+import { saveCreds, removeCreds, loadCreds, getCreds } from './creds.mjs';
+
+const IM_PLATFORMS = ['lark', 'feishu'];
 
 const SUPERVISOR = fileURLToPath(new URL('./acp-bridge.mjs', import.meta.url));
 const reg = openRegistry();
@@ -29,8 +31,10 @@ Usage:
   concord join <agent> [--room <id>] [--cwd .] [--budget N] [--fg]
       Host a coding agent into a Concord room (web / multi-agent). Progress OFF.
       No --room → opens a browser to create/pick one, then starts.
-  concord host <agent> [--room <id>] [--cwd .] [--budget N] [--fg]
-      join + connect your own IM bot (personal mode). Progress ON.
+  concord host <agent> [--room <id>] [--cwd .] [--budget N] [--im lark|feishu] [--fg]
+      join + connect your own IM bot (personal mode). Progress ON. Talk to the agent
+      from Lark/Feishu — private chat (no @) or @-mention in a group. --im picks the
+      platform; omit it if exactly one is logged in (concord login). No creds → room-only.
   concord login lark|feishu --app-id <id> [--app-secret <s>]   Store your own bot creds (0600)
   concord logout [lark|feishu]       Remove stored creds
   concord list                       List hosted agents
@@ -59,8 +63,24 @@ function buildSupArgs(f) {
   return a;
 }
 
+// Pick the IM platform for `concord host` (`join` is room-only). Explicit --im wins;
+// else auto-use the single logged-in platform; multiple → require --im; none → room-only.
+// The secret is NOT passed via env/argv — the bridge reads ~/.concord/creds.json (0600).
+function resolveImPlatform(cfg, mode) {
+  if (mode !== 'host') return null;
+  if (cfg.im) {
+    if (!IM_PLATFORMS.includes(cfg.im)) die(`--im must be one of: ${IM_PLATFORMS.join(' | ')}`);
+    if (!getCreds(cfg.im)) die(`no ${cfg.im} credentials — run:  concord login ${cfg.im} --app-id <id> --app-secret <secret>`);
+    return cfg.im;
+  }
+  const loggedIn = IM_PLATFORMS.filter((p) => getCreds(p));
+  if (loggedIn.length === 1) return loggedIn[0];
+  if (loggedIn.length > 1) die(`multiple IM platforms logged in (${loggedIn.join(', ')}) — pick one with --im lark|feishu`);
+  return null;   // none logged in → host runs room-only
+}
+
 function spawnDaemon(id, f, { fg }) {
-  const env = { ...process.env, STORE_PATH: reg.statePath(id), ACP_PROGRESS: f.mode === 'host' ? '1' : '0' };
+  const env = { ...process.env, STORE_PATH: reg.statePath(id), ACP_PROGRESS: f.mode === 'host' ? '1' : '0', ACP_IM: f.im || '' };
   const supArgs = buildSupArgs(f);
   if (fg) {
     reg.register({ id, ...f });
@@ -93,13 +113,14 @@ async function startHost(mode, args) {
   let room = cfg.roomId;
   if (!room) { room = await obtainRoomId(cfg.publicUrl || cfg.url); console.log('  → room connected.'); }
 
+  const im = resolveImPlatform(cfg, mode);
   const id = newId(cfg.agent);
   const f = {
-    agent: cfg.agent, mode, room, cwd, url: cfg.url,
+    agent: cfg.agent, mode, room, cwd, url: cfg.url, im,
     budget: cfg.budget || null, budgetWindowHours: cfg.budgetWindowHours || null,
   };
   const pid = spawnDaemon(id, f, { fg });
-  if (!fg) console.log(`✓ ${mode} started — id ${id} · pid ${pid} · agent ${cfg.agent} · room ${shortRoom(room)}\n  concord logs ${id}   ·   concord stop ${id}`);
+  if (!fg) console.log(`✓ ${mode} started — id ${id} · pid ${pid} · agent ${cfg.agent} · room ${shortRoom(room)}${im ? ` · im ${im}` : ''}\n  concord logs ${id}   ·   concord stop ${id}`);
 }
 
 function listHosts() {
