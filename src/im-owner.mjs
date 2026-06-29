@@ -71,7 +71,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, log =
     const d = classifyInbound({ text, chatType: m.chat_type, mentions: m.mentions });
     const chatId = m.chat_id;
     const sender = data?.sender?.sender_id?.open_id || 'user';
-    log(`[owner] ${m.chat_type} ${short(chatId)} → ${d.action}`);
+    log(`[owner] ${m.chat_type} ${short(chatId)} text=${JSON.stringify(text.slice(0, 40))} → ${d.action}`);
     if (d.action === 'bind') return handleBind(chatId, m.chat_type);
     if (d.action === 'unbind') return handleUnbind(chatId);
     if (d.action === 'message') return routeMessage(chatId, d.text, sender);
