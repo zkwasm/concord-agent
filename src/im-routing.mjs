@@ -9,8 +9,10 @@ export function commandOf(text) {
   return String(text || '').replace(/@\S+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
-const BIND = 'concord-bind';
-const UNBIND = 'concord-unbind';
+// Slash form is canonical (reads as a command, like /usage); bare form accepted too so
+// a missing slash doesn't fall through to the agent as "I don't know that command".
+const BIND = new Set(['/concord-bind', 'concord-bind']);
+const UNBIND = new Set(['/concord-unbind', 'concord-unbind']);
 const USAGE = new Set(['/usage', '/stats', '用量']);
 
 // Decide what the owner should do with one inbound message.
@@ -24,8 +26,8 @@ export function classifyInbound({ text, chatType, mentions } = {}) {
   const atBot = chatType === 'p2p' || (Array.isArray(mentions) && mentions.length > 0);
   if (!atBot) return { action: 'ignore', reason: 'group-no-at' };   // group message that didn't @ the bot
   const cmd = commandOf(clean);
-  if (cmd === BIND) return { action: 'bind' };
-  if (cmd === UNBIND) return { action: 'unbind' };
+  if (BIND.has(cmd)) return { action: 'bind' };
+  if (UNBIND.has(cmd)) return { action: 'unbind' };
   if (USAGE.has(cmd)) return { action: 'usage' };
   return { action: 'message', text: clean };
 }

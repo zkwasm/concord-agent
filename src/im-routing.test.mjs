@@ -21,11 +21,15 @@ test('group: only when the bot is @-mentioned', () => {
   assert.deepEqual(classifyInbound({ text: '@bot 跑测试', chatType: 'group', mentions: [{ key: '@_user_1' }] }), { action: 'message', text: '@bot 跑测试' });
 });
 
-test('bind / unbind commands detected in both p2p and group (@bot stripped)', () => {
+test('bind / unbind: /concord-bind canonical + bare accepted, in p2p and group', () => {
+  // canonical slash form (reads as a command, @bot stripped in groups)
+  assert.equal(classifyInbound({ text: '/concord-bind', chatType: 'p2p' }).action, 'bind');
+  assert.equal(classifyInbound({ text: '@bot /concord-bind', chatType: 'group', mentions: [{ key: '@_user_1' }] }).action, 'bind');
+  assert.equal(classifyInbound({ text: '/concord-unbind', chatType: 'p2p' }).action, 'unbind');
+  assert.equal(classifyInbound({ text: '@bot /concord-unbind', chatType: 'group', mentions: [{ key: '@_u' }] }).action, 'unbind');
+  // bare form still accepted (a missing slash must not fall through to the agent)
   assert.equal(classifyInbound({ text: 'concord-bind', chatType: 'p2p' }).action, 'bind');
-  assert.equal(classifyInbound({ text: '@bot concord-bind', chatType: 'group', mentions: [{ key: '@_user_1' }] }).action, 'bind');
   assert.equal(classifyInbound({ text: 'concord-unbind', chatType: 'p2p' }).action, 'unbind');
-  assert.equal(classifyInbound({ text: '@bot concord-unbind', chatType: 'group', mentions: [{ key: '@_user_1' }] }).action, 'unbind');
 });
 
 test('usage query detected; group usage still needs the @', () => {
