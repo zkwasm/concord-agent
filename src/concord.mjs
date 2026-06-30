@@ -22,6 +22,7 @@ import { obtainRoomId } from './handoff.mjs';
 import { saveCreds, removeCreds, loadCreds, getCreds } from './creds.mjs';
 import { openBindings } from './im-bindings.mjs';
 import { fetchRoomName } from './room-meta.mjs';
+import { ownerAction } from './owner-lifecycle.mjs';
 
 const IM_PLATFORMS = ['lark', 'feishu'];
 
@@ -233,6 +234,7 @@ function statusHost(id) {
   const lines = [];
   lines.push(`id      ${h.id}${h.label ? `    label ${h.label}` : ''}`);
   lines.push(`agent   ${h.agent}    mode ${h.mode}`);
+  if (h.appId) lines.push(`app     ${h.appId}${h.platform ? ` · ${h.platform}` : ''}`);   // IM owner: which bot app it's connected to
   lines.push(`status  ${status}    pid ${h.pid || '-'}    up ${h.started ? ago(h.started) : '-'}`);
   // What it's doing right now / why it's paused / why it died — the legibility wins.
   if (alive && !h.stopped) {
@@ -505,8 +507,9 @@ async function loginViaQR(platform, opts = {}) {
     // Idempotent: still ensure the owner is up. Re-running this command becomes a
     // safe "check + repair" — useful after a reboot that lost the daemon.
     try {
-      const { pid, started } = startImOwnerIfNeeded(platform, undefined);
-      console.log(`\n${started ? '✓ IM owner 已启动' : '✓ IM owner 已在运行'} (pid ${pid}) — 直接去聊天发 /concord-bind 即可。`);
+      const { pid, started, restarted } = await startImOwnerIfNeeded(platform, undefined);
+      const how = restarted ? '✓ IM owner 已对齐当前应用并重启' : started ? '✓ IM owner 已启动' : '✓ IM owner 已在运行';
+      console.log(`\n${how} (pid ${pid}) — 直接去聊天发 /concord-bind 即可。`);
     } catch (e) {
       console.log('\n⚠️  自动启动 IM owner 失败:' + (e?.message || e));
     }
@@ -545,8 +548,9 @@ async function loginViaQR(platform, opts = {}) {
   // a chat with new creds shouldn't double-spawn). Errors here are non-fatal — the user
   // has working creds either way and can fall back to `concord im` manually.
   try {
-    const { pid, started } = startImOwnerIfNeeded(platform, undefined);
-    if (started) console.log(`✓ IM owner 已启动 (pid ${pid}) — 现在去聊天里发 /concord-bind 就行。`);
+    const { pid, started, restarted, appId } = await startImOwnerIfNeeded(platform, undefined);
+    if (restarted) console.log(`✓ IM owner 已切到新应用并重启 (pid ${pid}, appId ${appId}) — 现在去聊天里发 /concord-bind 就行。`);
+    else if (started) console.log(`✓ IM owner 已启动 (pid ${pid}) — 现在去聊天里发 /concord-bind 就行。`);
     else console.log(`✓ IM owner 已在运行 (pid ${pid}) — 直接去聊天里发 /concord-bind 即可。`);
     console.log('   日志:  concord logs ' + imOwnerId(platform));
   } catch (e) {
@@ -579,6 +583,12 @@ async function login(args) {
   if (!appSecret) die('--app-secret is required (or pipe it on stdin to keep it out of history)');
   saveCreds(platform, { appId, appSecret, domain: platform });
   console.log(`✓ saved ${platform} credentials for app ${appId} → ~/.concord/creds.json (0600)`);
+  // If an owner is already running on a DIFFERENT app, move it onto this one (it's pinned
+  // to the app baked in at spawn). Don't newly start one here — that's `concord im`'s job.
+  try {
+    const r = await startImOwnerIfNeeded(platform, undefined, { startIfAbsent: false });
+    if (r.restarted) console.log(`✓ moved the running IM owner onto app ${appId} (pid ${r.pid})`);
+  } catch (e) { console.log('⚠️  could not refresh the IM owner: ' + (e?.message || e)); }
 }
 function logout(args) {
   const platform = args[0];
@@ -594,17 +604,28 @@ const imOwnerId = (platform) => `im-${platform}`;
 // Spawn the IM owner daemon for a platform (background, detached). Returns the running
 // pid + whether we just started it or it was already up. Used by both `concord im` and
 // `concord login --qr` (which auto-starts the owner so the user is done in one command).
-function startImOwnerIfNeeded(platform, url) {
+// Ensure the IM owner for `platform` is running AND connected to the CURRENT creds' app.
+// The owner bakes appId/appSecret into its WSClient at spawn, so a creds switch (new bot
+// app) leaves a live owner pinned to the OLD app — the new app then has nothing listening
+// and `/concord-bind` on it silently drops. So this is creds-aware: a running owner on a
+// different app is STOPPED and restarted onto the new one. `startIfAbsent:false` only
+// repairs a stale running owner without newly starting one (manual `--app-id` path).
+async function startImOwnerIfNeeded(platform, url, { startIfAbsent = true } = {}) {
   const id = imOwnerId(platform);
+  const wantAppId = getCreds(platform)?.appId || null;
   const existing = reg.get(id);
-  if (existing && existing.pid && kill(existing.pid, 0)) return { pid: existing.pid, started: false };
+  const alive = !!(existing && existing.pid && kill(existing.pid, 0));
+  const action = ownerAction({ alive, existingAppId: existing?.appId || null, wantAppId, startIfAbsent });
+  if (action === 'keep') return { pid: existing.pid, started: false, restarted: false, appId: existing.appId };
+  if (action === 'noop') return { pid: null, started: false, restarted: false, running: false };
+  if (action === 'restart') await stopHostCmd(id, { silent: true });   // stale app → tear the old owner down first
   const env = { ...process.env, ...(url ? { CONCORD_URL: url } : {}) };
   mkdirSync(reg.hostDir(id), { recursive: true });
   const out = openSync(join(reg.hostDir(id), 'log'), 'a');
   const child = spawn(process.execPath, [OWNER, platform], { detached: true, stdio: ['ignore', out, out], env });
   child.unref();
-  reg.register({ id, mode: 'im', platform, agent: '-', room: '-', pid: child.pid, log: join(reg.hostDir(id), 'log') });
-  return { pid: child.pid, started: true };
+  reg.register({ id, mode: 'im', platform, appId: wantAppId, agent: '-', room: '-', pid: child.pid, log: join(reg.hostDir(id), 'log') });
+  return { pid: child.pid, started: true, restarted: action === 'restart', appId: wantAppId };
 }
 async function imCmd(args) {
   const { positional } = parseArgs(args);
@@ -621,20 +642,26 @@ async function imCmd(args) {
   if (!platform) die('no IM platform logged in — easiest: `concord login lark --qr` (scan a QR; no developer console). Or use `--app-id`/`--app-secret`.');
   const id = imOwnerId(platform);
   const existing = reg.get(id);
-  if (existing && existing.pid && kill(existing.pid, 0)) die(`a concord im owner for ${platform} is already running (id ${id}, pid ${existing.pid}). One bot = one owner — stop it first: concord im stop`);
+  const wantAppId = getCreds(platform)?.appId || null;
+  const alive = existing && existing.pid && kill(existing.pid, 0);
+  // Only refuse when a healthy owner is already on the CURRENT app. A live owner pinned to
+  // a STALE app falls through — startImOwnerIfNeeded restarts it onto the current creds.
+  if (alive && (!wantAppId || existing.appId === wantAppId)) {
+    die(`a concord im owner for ${platform} is already running (id ${id}, pid ${existing.pid}). One bot = one owner — stop it first: concord im stop`);
+  }
   // --fg keeps the owner attached (stdio inherited) — useful for debugging the WSClient
   // handshake. The default background path goes through startImOwnerIfNeeded so the
   // detached spawn / registry write is the same as the `concord login --qr` auto-start.
   if (args.includes('--fg')) {
-    reg.register({ id, mode: 'im', platform, agent: '-', room: '-' });
+    reg.register({ id, mode: 'im', platform, appId: wantAppId, agent: '-', room: '-' });
     const env = { ...process.env, CONCORD_URL: cfg.url };
     const child = spawn(process.execPath, [OWNER, platform], { stdio: 'inherit', env });
     reg.update(id, { pid: child.pid });
     child.on('close', () => reg.update(id, { pid: null, stopped: true }));
     return;
   }
-  const { pid } = startImOwnerIfNeeded(platform, cfg.url);
-  console.log(`✓ im owner started — ${platform} · id ${id} · pid ${pid}\n  concord logs ${id}   ·   concord im stop`);
+  const { pid, restarted } = await startImOwnerIfNeeded(platform, cfg.url);
+  console.log(`✓ im owner ${restarted ? 'restarted onto current app' : 'started'} — ${platform} · id ${id} · pid ${pid}\n  concord logs ${id}   ·   concord im stop`);
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
