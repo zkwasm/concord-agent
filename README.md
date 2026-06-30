@@ -28,19 +28,26 @@ The "resident session = zero idle tokens" value comes from ACP itself; this tool
 ## Commands
 
 ```
-concord join <agent> [room] [--cwd .] [--budget N] [--fg]
+concord join <agent> [room] [--cwd .] [--budget N] [--as label] [--fg]
     Host a coding agent in a Concord room (web / multi-agent). Progress OFF.
     No --room → opens a browser to create/pick one, then starts.
-concord host <agent> [room] [--cwd .] [--budget N] [--fg]
+concord host <agent> [room] [--cwd .] [--budget N] [--as label] [--fg]
     join + connect your own IM bot (personal mode). Progress ON.
 concord login lark|feishu --qr                  Scan a QR to create + log in the bot (recommended; no developer console, no version publish)
 concord login lark|feishu --app-id <id> [--app-secret <s>]   ...or store bot creds manually (0600)
 concord im [stop|status|logs]                   Run the IM owner — owns your bot + relays bound chats (one per bot)
 concord logout [lark|feishu]
-concord list | status <id> | logs <id> [-f]
-concord stop <id> | restart <id> | rm <id> | prune
+concord list                                    Hosted agents: room name · what each is doing · status (working/idle/paused/crashed)
+concord status <id> | logs <id> [-f]            One host's detail (activity, IM binding, dashboard link) / its output
+concord open <id>                               Open the host's room on the dashboard
+concord label <id> <label>                      Name a host (use the label anywhere an id is expected)
+concord bindings                                List IM chat → room bindings, with health
+concord stop <id> [--yes] | restart <id> [--yes] | rm <id> [--yes] | prune
 concord budget <id> [--reset] | resume <id>
 concord help
+
+# <id> accepts a label or a unique id-prefix, not just the full id. Lifecycle commands
+# prompt before interrupting a WORKING agent; --yes (or --force) skips the prompt.
 ```
 
 Hosts run in the background by default (`--fg` to stay foreground). `<agent>`: `claude` (default) | `codex` | `gemini` | …

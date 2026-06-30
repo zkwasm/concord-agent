@@ -63,6 +63,7 @@ export function resolveConfig(argv, env = {}) {
     effort: pick('effort', 'AGENT_EFFORT', ''),
     budget: pick('budget', 'AGENT_TOKEN_BUDGET', null),                       // max fresh tokens / window; null = unlimited
     budgetWindowHours: pick('budget-window-hours', 'AGENT_BUDGET_WINDOW_HOURS', null), // rolling window, default 24h
+    label: pick('as', 'CONCORD_LABEL', null),                                // --as <label>: a memorable handle for `concord list`/`stop`/… (registry metadata only)
     im: pick('im', 'ACP_IM', null),                                          // 'lark' | 'feishu' — bridge this host's room to your IM bot
     bind: flags.bind ?? null,                                                // --bind <chat_id>: bind this host's room to an IM chat (the `concord im` owner relays)
     force: flags.force === true,                                             // --force: overwrite an existing binding

@@ -80,6 +80,23 @@ test('getUsage returns a copy (caller cannot mutate internal state)', () => {
   assert.equal(s.getUsage('r').fresh, 10);
 });
 
+test('runtime activity/paused/exit round-trip + survive reopen (for concord list/status)', () => {
+  const path = freshPath();
+  const s = openStore(path);
+  s.setActivity('working', 'edit foo.ts', 1000);
+  s.setPaused('timeouts', 2000);
+  s.setExit('uncaught: boom', 3000);
+  const re = openStore(path)._state();
+  assert.deepEqual(re.activity, { state: 'working', label: 'edit foo.ts', at: 1000 });
+  assert.deepEqual(re.paused, { reason: 'timeouts', at: 2000 });
+  assert.deepEqual(re.exit, { reason: 'uncaught: boom', at: 3000 });
+  // clearers null them out (resume clears pause; a clean start clears exit)
+  s.setPaused(null); s.setExit(null);
+  const re2 = openStore(path)._state();
+  assert.equal(re2.paused, null);
+  assert.equal(re2.exit, null);
+});
+
 test('corrupt file does not crash; starts fresh', () => {
   const path = freshPath();
   writeFileSync(path, '{ not valid json');

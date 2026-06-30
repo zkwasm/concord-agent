@@ -69,7 +69,7 @@ function introText() {
   return bits.join(' · ') + '。把任务发给我。';
 }
 
-const die = (m) => { console.error('✗ ' + m); process.exit(1); };
+const die = (m) => { try { store?.setExit?.('exit: ' + m); } catch { /* state is best-effort */ } console.error('✗ ' + m); process.exit(1); };
 // The CLI always injects STORE_PATH (~/.concord/hosts/<id>/state.json). The
 // fallback (direct `node acp-bridge.mjs` runs) goes to a WRITABLE user dir, never
 // next to the module — a globally-installed package dir is typically read-only.
@@ -110,12 +110,22 @@ async function joinRoom() {
 // rejected (413) and vanish silently. On 413, resend a truncated version so the chat
 // gets the (clipped) reply instead of nothing — same "never go silent" rule as a turn end.
 const ROOM_MSG_LIMIT = 45000;
+// Smart truncation: a hard prefix-cut drops the conclusion (often the most useful part)
+// AND hides whether the task finished. Keep the head AND the tail, and say exactly how
+// much was dropped, so the human reads it as a length cut, not a crash. Clipping at
+// ROOM_MSG_LIMIT (< the room's ~50k char cap) proactively also beats the SILENT
+// server-side truncation, not just the 2MB-body 413.
+function clip(text) {
+  const head = Math.floor(ROOM_MSG_LIMIT * 0.7), tail = ROOM_MSG_LIMIT - head;
+  const dropped = text.length - head - tail;
+  const lines = text.split('\n').length;
+  return `${text.slice(0, head)}\n\n  …✂ 已省略中间 ${dropped} 字(共 ${lines} 行,回复过大,保留开头与结尾)…\n\n${text.slice(-tail)}`;
+}
 async function sendToRoom(text) {
-  const body = { sender: senderName, agentSessionId: sessionId, content: text };
+  const content = text.length > ROOM_MSG_LIMIT ? clip(text) : text;
+  const body = { sender: senderName, agentSessionId: sessionId, content };
   const res = await post('/messages', body);
-  if (res.status === 413) {
-    return post('/messages', { ...body, content: text.slice(0, ROOM_MSG_LIMIT) + '\n\n…(回复过大,已截断)' });
-  }
+  if (res.status === 413) return post('/messages', { ...body, content: clip(text) });   // backstop if even the clipped body is rejected
   if (!res.ok) console.warn(`room post ${res.status} — message may not have landed`);
   return res;
 }
@@ -272,6 +282,7 @@ async function drain() {
       pending.shift();
       currentImChat = item.imChat;                             // route this turn's progress + reply to its IM chat (if any)
       console.log(`\n▶ turn start  ·  ${item.text.slice(0, 80)}`);
+      store.setActivity('working', item.text.replace(/^\[[^\]]*\]\s*/, '').slice(0, 60));   // surface to `concord list`/`status`
       try {
         const { reply, usage } = await runTurn(item.text);
         recreateTimes = [];                                    // a clean turn means the engine recovered → reset the crash-loop guard
@@ -295,7 +306,7 @@ async function drain() {
           timeoutTimes = timeoutTimes.filter((t) => now - t < TIMEOUT_WINDOW_MS);
           timeoutTimes.push(now);
           if (timeoutTimes.length >= MAX_TIMEOUTS_WINDOW) {
-            paused = true; pending.length = 0;
+            paused = true; pending.length = 0; store.setPaused('timeouts');   // persist so `concord list` shows PAUSED, not a silently-dropping "running"
             await out(`⏸️ 多次超时(${MAX_TIMEOUTS_WINDOW} 次),已暂停以免持续烧 token。用 \`concord list\` 找到 id 后 \`concord resume <id>\` 或 \`concord restart <id>\`。`).catch(() => {});
             break;
           }
@@ -309,6 +320,7 @@ async function drain() {
     }
   } finally {
     busy = false;   // ALWAYS reset, so a failure can't wedge the host busy forever
+    if (!paused) store.setActivity('idle');   // queue drained → idle (a pause is surfaced separately)
   }
 }
 
@@ -371,13 +383,18 @@ process.on('SIGINT', () => { cleanShutdown('SIGINT'); });
 // not take the whole host down — log and carry on. drain() handles turn-level
 // failures; this is the last-resort backstop (the #1 review finding).
 process.on('unhandledRejection', (reason) => { console.error('unhandledRejection (non-fatal):', reason?.message || reason); });
+// A FATAL uncaught error still crashes the supervisor (exit 1) — but record WHY first,
+// so `concord status` can show the reason instead of a bare "crashed".
+process.on('uncaughtException', (e) => { try { store.setExit('uncaught: ' + (e?.message || e)); } catch { /* best effort */ } console.error('uncaughtException:', e); process.exit(1); });
 // `concord resume` / `concord budget --reset` signals us to clear a budget pause
 // without a restart (we own the in-memory usage, so a file edit wouldn't be seen).
-process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); warned80 = false; paused = false; timeoutTimes = []; console.log('SIGUSR1 → budget window reset + unpaused; accepting tasks again'); });
+process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); warned80 = false; paused = false; timeoutTimes = []; store.setPaused(null); store.setActivity('idle'); console.log('SIGUSR1 → budget window reset + unpaused; accepting tasks again'); });
 
 await joinRoom();
 try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}\n  (first run fetches the ACP adapter via npx — check network access to the npm registry, or pre-warm it by running the command printed above)`); }
 try { await startIm(); } catch (e) { console.warn('IM bridge failed to start (room-only): ' + (e?.message || e)); }
 console.log(`✓ acp-bridge up. Driving "${AGENT}" over ACP in ${AGENT_CWD} (progress=${PROGRESS ? 'on' : 'off'}, permission=${PERMISSION_POLICY}${IM_PLATFORM ? `, im=${IM_PLATFORM}` : ''}).`);
 console.log(`  Idle = room long-poll + agent idle. Send a room${IM_PLATFORM ? `/IM` : ''} message to wake it.`);
+store.setExit(null);            // clean start → clear any stale crash record from a prior incarnation
+store.setActivity('idle');     // up and waiting for work
 pollLoop();

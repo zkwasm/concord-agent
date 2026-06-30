@@ -14,12 +14,14 @@ import { spawn } from 'node:child_process';
 import { openSync, createReadStream, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline';
 import { resolveConfig, parseArgs } from './cli.mjs';
 import { openRegistry, newId } from './hosts.mjs';
 import { stopHost, reapAdapterGroup, procStart } from './reclaim.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { saveCreds, removeCreds, loadCreds, getCreds } from './creds.mjs';
 import { openBindings } from './im-bindings.mjs';
+import { fetchRoomName } from './room-meta.mjs';
 
 const IM_PLATFORMS = ['lark', 'feishu'];
 
@@ -31,10 +33,10 @@ const reg = openRegistry();
 const USAGE = `concord — host coding agents in Concord rooms (stdio supervisor)
 
 Usage:
-  concord join <agent> [room] [--cwd .] [--budget N] [--fg]
+  concord join <agent> [room] [--cwd .] [--budget N] [--as label] [--fg]
       Host a coding agent into a Concord room (web / multi-agent). Progress OFF.
       No room → opens a browser to create/pick one, then starts. (or --room <id>)
-  concord host <agent> [room] [--cwd .] [--budget N] [--im lark|feishu] [--fg]
+  concord host <agent> [room] [--cwd .] [--budget N] [--as label] [--im lark|feishu] [--fg]
       join + connect your own IM bot (personal mode). Progress ON. Talk to the agent
       from Lark/Feishu — private chat (no @) or @-mention in a group. --im picks the
       platform; omit it if exactly one is logged in (concord login). No creds → room-only.
@@ -45,14 +47,17 @@ Usage:
                                                    --new builds a fresh app, --force re-scans to update the existing one.
   concord login lark|feishu --app-id <id> [--app-secret <s>]   Store your own bot creds manually (0600)
   concord logout [lark|feishu]       Remove stored creds
-  concord list                       List hosted agents
-  concord status <id>                Detail for one host
+  concord list                       List hosted agents (room name · what each is doing · status)
+  concord status <id>                Detail for one host (activity, IM binding, dashboard link)
   concord logs <id> [-f]             View a host's output (-f to follow)
-  concord stop <id>                  Stop + clean reclaim (SIGTERM → kills the agent group)
-  concord restart <id>               Stop then start again with the same config
+  concord open <id>                  Open the host's room in your browser (dashboard)
+  concord label <id> <label>         Give a host a memorable name (usable anywhere an id is expected)
+  concord bindings                   List IM chat → room bindings (with health)
+  concord stop <id> [--yes]          Stop + clean reclaim (--yes skips the working-agent prompt)
+  concord restart <id> [--yes]       Stop then start again with the same config
   concord budget <id> [--reset]      Show token usage / clear a budget pause
-  concord resume <id>                Clear a budget pause (accept tasks again)
-  concord rm <id> | prune            Stop + reclaim (if running) then remove an entry / drop dead ones
+  concord resume <id>                Clear a timeout/budget pause (accept tasks again)
+  concord rm <id> [--yes] | prune    Stop + reclaim (if running) then remove an entry / drop dead ones
   concord shutdown                   Stop EVERYTHING — IM owner + all agents + clear all bindings
   concord version                    Show the concord-agent version (also -v / --version)
   concord help
@@ -63,7 +68,24 @@ agent: claude | gemini | codex | cursor | copilot | …  (default: claude)`;
 
 const die = (m) => { console.error('✗ ' + m); process.exit(1); };
 const kill = (pid, sig) => { try { process.kill(pid, sig); return true; } catch { return false; } };
+// Interactive y/N confirmation (used before interrupting a WORKING agent). Resolves
+// false in a non-TTY so scripts never hang — callers require --yes there instead.
+function confirm(question) {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(`${question} [y/N] `, (a) => { rl.close(); resolve(/^y(es)?$/i.test(a.trim())); });
+  });
+}
 const shortRoom = (r) => (r ? r.slice(0, 8) : '-');
+// Display width: CJK / fullwidth glyphs take two terminal columns, so the list table
+// pads by width (not string length) — otherwise a room named 「设计评审」 skews the row.
+const WIDE = /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]/;
+const dispWidth = (s) => { let w = 0; for (const ch of String(s)) w += WIDE.test(ch) ? 2 : 1; return w; };
+const padCol = (s, w) => String(s) + ' '.repeat(Math.max(0, w - dispWidth(s)));
+const truncWidth = (s, max) => { s = String(s); if (dispWidth(s) <= max) return s; let out = '', w = 0; for (const ch of s) { const cw = WIDE.test(ch) ? 2 : 1; if (w + cw > max - 1) break; w += cw; out += ch; } return out + '…'; };
+// What `list`/`status` show for a room: the cached human name if we have one, else the
+// short id, truncated to keep the table column aligned. Purely local — never a network read.
+const roomLabel = (h) => truncWidth(h.roomName || shortRoom(h.room), 20);
 const ago = (t) => { const s = Math.max(0, Math.round((Date.now() - t) / 1000)); return s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : `${Math.round(s / 3600)}h`; };
 
 // Build the supervisor argv from saved fields (used by start + restart).
@@ -170,8 +192,14 @@ async function startHost(mode, args) {
 
   const im = bound ? null : resolveImPlatform(cfg, mode);
   const id = newId(cfg.agent);
+  // Cache the human room name now — we're online and the user is present — so later
+  // `concord list`/`status` can show it with zero network. Best-effort: '' on failure,
+  // and list/status fall back to the short room id.
+  const roomName = await fetchRoomName(cfg.url, room);
   const f = {
     agent: cfg.agent, mode, room, cwd, url: cfg.url, im, bound,
+    ...(roomName ? { roomName } : {}),
+    ...(cfg.label ? { label: cfg.label } : {}),
     budget: cfg.budget || null, budgetWindowHours: cfg.budgetWindowHours || null,
   };
   const pid = spawnDaemon(id, f, { fg });
@@ -181,34 +209,94 @@ async function startHost(mode, args) {
 function listHosts() {
   const hosts = reg.list();
   if (!hosts.length) { console.log('(no hosted agents — `concord host <agent>` or `concord join <agent>`)'); return; }
-  console.log('ID                 AGENT    MODE  ROOM      STATUS    PID     UP     TOK');
+  // One formatter for header AND rows so the (now wider) ROOM column stays aligned.
+  const row = (c) => `${padCol(c[0], 18)} ${padCol(c[1], 8)} ${padCol(c[2], 5)} ${padCol(c[3], 20)} ${padCol(c[4], 9)} ${padCol(c[5], 7)} ${padCol(c[6], 6)} ${c[7]}`;
+  console.log(row(['ID', 'AGENT', 'MODE', 'ROOM', 'STATUS', 'PID', 'UP', 'TOK']));
   for (const h of hosts) {
-    const status = h.stopped ? 'stopped' : h.alive ? 'running' : 'crashed';
+    const rt = readRuntime(h.id);
+    // STATUS now tells you what the agent is DOING, not just whether the pid is alive:
+    // working (mid-turn) / idle / paused (silently dropping) / crashed / stopped.
+    const status = h.stopped ? 'stopped' : !h.alive ? 'crashed' : rt.paused ? 'paused' : rt.activity?.state === 'working' ? 'working' : 'idle';
     const u = readUsage(h.id, h.room);
     const tok = u ? String(u.fresh ?? 0) : '-';   // fresh tokens this window — a burner stands out at a glance
-    console.log(
-      `${h.id.padEnd(18)} ${(h.agent || '').padEnd(8)} ${(h.mode || '').padEnd(5)} ${shortRoom(h.room).padEnd(9)} ${status.padEnd(9)} ${String(h.pid || '-').padEnd(7)} ${(h.started ? ago(h.started) : '-').padEnd(6)} ${tok}`,
-    );
+    console.log(row([truncWidth(h.label || h.id, 18), h.agent || '', h.mode || '', roomLabel(h), status, String(h.pid || '-'), h.started ? ago(h.started) : '-', tok]));
   }
 }
 
 function statusHost(id) {
+  id = resolveId(id);
   const h = reg.get(id);
   if (!h) die(`no such host: ${id}`);
   const alive = h.pid ? kill(h.pid, 0) : false;
-  console.log(`id      ${h.id}
-agent   ${h.agent}    mode ${h.mode}
-status  ${h.stopped ? 'stopped' : alive ? 'running' : 'crashed'}    pid ${h.pid || '-'}    up ${h.started ? ago(h.started) : '-'}
-room    ${h.room}
-url     ${h.url}
-cwd     ${h.cwd}
-state   ${reg.statePath(h.id)}
-budget  ${h.budget ? `${h.budget} fresh tok / ${h.budgetWindowHours || 24}h` : 'unlimited'}
-used    ${(() => { const u = readUsage(h.id, h.room); return u ? `fresh ${u.fresh} · cache-read ${u.cached} · ${u.turns || 0} turns` : '(none yet)'; })()}
-logs    concord logs ${h.id}`);
+  const rt = readRuntime(h.id);
+  const status = h.stopped ? 'stopped' : !alive ? 'crashed' : rt.paused ? 'paused' : rt.activity?.state === 'working' ? 'working' : 'idle';
+  const lines = [];
+  lines.push(`id      ${h.id}${h.label ? `    label ${h.label}` : ''}`);
+  lines.push(`agent   ${h.agent}    mode ${h.mode}`);
+  lines.push(`status  ${status}    pid ${h.pid || '-'}    up ${h.started ? ago(h.started) : '-'}`);
+  // What it's doing right now / why it's paused / why it died — the legibility wins.
+  if (alive && !h.stopped) {
+    if (rt.paused) lines.push(`paused  ${rt.paused.reason} · ${ago(rt.paused.at)} ago  →  concord resume ${h.id}`);
+    else if (rt.activity?.state === 'working') lines.push(`doing   ▶ ${rt.activity.label || '(working)'}  (${ago(rt.activity.at)})`);
+    else if (rt.activity) lines.push(`doing   idle ${ago(rt.activity.at)}`);
+  } else if (!h.stopped && rt.exit) {
+    lines.push(`exit    ${rt.exit.reason} · ${ago(rt.exit.at)} ago`);
+  }
+  lines.push(`room    ${h.roomName ? `${h.roomName}  ·  ${h.room}` : h.room}`);
+  // The IM chat bound to this room (reverse lookup), so CLI and IM agree on what this host is.
+  const binding = Object.values(openBindings().list()).find((b) => b.roomId === h.room);
+  if (binding) lines.push(`im      ${binding.platform} · ${binding.chatName || binding.chatId}${binding.boundAt ? ` (bound ${ago(binding.boundAt)} ago)` : ''}`);
+  lines.push(`web     ${h.url}/room/${h.room}`);          // open this exact room on the dashboard
+  lines.push(`url     ${h.url}   (api base)`);
+  lines.push(`cwd     ${h.cwd}`);
+  lines.push(`state   ${reg.statePath(h.id)}`);
+  lines.push(`budget  ${h.budget ? `${h.budget} fresh tok / ${h.budgetWindowHours || 24}h` : 'unlimited'}`);
+  const u = readUsage(h.id, h.room);
+  lines.push(`used    ${u ? `fresh ${u.fresh} · cache-read ${u.cached} · ${u.turns || 0} turns` : '(none yet)'}`);
+  lines.push(`logs    concord logs ${h.id}`);
+  console.log(lines.join('\n'));
+}
+
+// Give a host a memorable handle. Stored as registry metadata; resolveId() then
+// accepts it anywhere an id is expected (stop/status/logs/…).
+function labelHost(id, label) {
+  id = resolveId(id);
+  const h = reg.get(id);
+  if (!h) die(`no such host: ${id}`);
+  reg.update(id, { label });
+  console.log(`✓ labeled ${id} → "${label}"  (use it anywhere an id goes, e.g. concord stop ${label})`);
+}
+
+// `concord open <id>` — open this host's room on the dashboard. Best-effort OS opener;
+// headless / no opener → just print the URL.
+function openRoom(id) {
+  id = resolveId(id);
+  const h = reg.get(id);
+  if (!h) die(`no such host: ${id}`);
+  const url = `${h.url}/room/${h.room}`;
+  const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+  try { spawn(opener, [url], { stdio: 'ignore', detached: true }).unref(); console.log(`✓ opening ${url}`); }
+  catch { console.log(url); }
+}
+
+// `concord bindings` — the IM chat → room table (invisible until now without a JSON
+// editor), cross-referenced against live hosts to flag orphaned bindings.
+function listBindings() {
+  const all = Object.values(openBindings().list());
+  if (!all.length) { console.log('(no IM bindings — `concord host <agent> --bind <chat-id>`, or DM your bot after `concord login … --qr`)'); return; }
+  const live = reg.list();
+  const liveRooms = new Set(live.filter((h) => h.alive).map((h) => h.room));
+  const nameByRoom = new Map(live.filter((h) => h.roomName).map((h) => [h.room, h.roomName]));
+  const row = (c) => `${padCol(c[0], 8)} ${padCol(c[1], 20)} ${padCol(c[2], 7)} ${padCol(c[3], 20)} ${padCol(c[4], 8)} ${c[5]}`;
+  console.log(row(['PLATFORM', 'CHAT', 'TYPE', 'ROOM', 'AGENT', 'HEALTH']));
+  for (const b of all) {
+    const health = liveRooms.has(b.roomId) ? 'ok' : '⚠ no live host';
+    console.log(row([b.platform || '-', truncWidth(b.chatName || b.chatId || '-', 20), b.chatType || '-', truncWidth(nameByRoom.get(b.roomId) || shortRoom(b.roomId), 20), b.agent || '-', health]));
+  }
 }
 
 function logsHost(id, follow) {
+  id = resolveId(id);
   const h = reg.get(id);
   if (!h) die(`no such host: ${id}`);
   const logPath = h.log || join(reg.hostDir(id), 'log');
@@ -244,6 +332,40 @@ function clearAdapter(id) {
 function readUsage(id, room) {
   try { return JSON.parse(readFileSync(reg.statePath(id), 'utf8')).rooms?.[room]?.usage ?? null; } catch { return null; }
 }
+// Live runtime a host writes into its own state.json (activity / paused / exit), so
+// `list`/`status` can show what it's DOING and WHY it stopped — not just pid-liveness.
+function readRuntime(id) {
+  try { const s = JSON.parse(readFileSync(reg.statePath(id), 'utf8')); return { activity: s.activity || null, paused: s.paused || null, exit: s.exit || null }; }
+  catch { return { activity: null, paused: null, exit: null }; }
+}
+// Map a user handle to a canonical host id: exact id, else a unique label, else a
+// unique id-prefix — so `concord stop billing-bot` (label) or `concord stop claude-3f`
+// (prefix) work, not just the full hex id. No/ambiguous match → return as-is (the
+// command then dies with "no such host").
+function resolveId(token) {
+  if (!token) return token;
+  const all = reg.list();
+  if (all.some((h) => h.id === token)) return token;
+  const byLabel = all.filter((h) => h.label === token);
+  if (byLabel.length === 1) return byLabel[0].id;
+  const byPrefix = all.filter((h) => h.id.startsWith(token));
+  if (byPrefix.length === 1) return byPrefix[0].id;
+  return token;
+}
+// Guard a destructive command (stop/rm/restart) from silently aborting an agent
+// mid-task. Returns true to proceed. --yes/--force skips; idle/dead never prompts; a
+// non-TTY without --yes refuses (scripts must opt in, never hang). Computes liveness
+// itself (reg.get records carry no `alive` flag — only reg.list() annotates it).
+async function okToInterrupt(h, action, { yes } = {}) {
+  if (yes) return true;
+  const alive = h.pid ? kill(h.pid, 0) : false;
+  if (!alive) return true;
+  const rt = readRuntime(h.id);
+  if (rt.activity?.state !== 'working') return true;
+  const what = rt.activity.label ? ` (${rt.activity.label})` : '';
+  if (!process.stdin.isTTY) { console.error(`✗ ${h.id} is WORKING${what} — re-run with --yes to ${action} it anyway.`); process.exitCode = 1; return false; }
+  return confirm(`⚠️  ${h.id} is WORKING${what}. ${action} it anyway?`);
+}
 // Reap a host's orphaned adapter group — identity-guarded (a recycled pid is skipped,
 // never killed) — and clear the recorded pid afterwards so the same stale integer is
 // acted on at most once instead of being re-rolled on every future command.
@@ -272,9 +394,11 @@ async function sweepOrphans() {
   } catch { /* best effort — never block a command on the sweep */ }
 }
 
-async function stopHostCmd(id, { silent } = {}) {
+async function stopHostCmd(id, { silent, yes } = {}) {
+  id = resolveId(id);
   const h = reg.get(id);
   if (!h) { if (!silent) die(`no such host: ${id}`); return; }
+  if (!silent && !(await okToInterrupt(h, 'stop', { yes }))) return;   // working-agent guard (user-facing stop only)
   const a = readAdapter(id);
   const { steps } = await stopHost({ ...h, adapterPid: a.pid, adapterStart: a.start }, { kill, startOf: procStart });
   reg.update(id, { pid: null, stopped: true, stoppedAt: Date.now() });
@@ -287,9 +411,11 @@ async function stopHostCmd(id, { silent } = {}) {
 // group alive burning tokens or memory. Guarantee: rm never produces an orphan. The
 // old rm just unregistered + deleted state, which orphaned a live group AND threw away
 // the pids needed to ever reap it.
-async function rmHost(id) {
+async function rmHost(id, { yes } = {}) {
+  id = resolveId(id);
   const h = reg.get(id);
   if (!h) die(`no such host: ${id}`);
+  if (!(await okToInterrupt(h, 'remove', { yes }))) return;
   await stopHostCmd(id, { silent: true });   // SIGTERM bridge + reap adapter group BEFORE we drop the pids/state
   reg.unregister(id, { removeState: true });
   // Drop any IM binding pointing at this host's room, so the owner stops relaying a
@@ -299,9 +425,11 @@ async function rmHost(id) {
   console.log(`✓ removed ${id} (stopped + reclaimed first — no orphans)${unbound ? ` · dropped ${unbound} IM binding(s)` : ''}`);
 }
 
-async function restartHost(id) {
+async function restartHost(id, { yes } = {}) {
+  id = resolveId(id);
   const h = reg.get(id);
   if (!h) die(`no such host: ${id}`);
+  if (!(await okToInterrupt(h, 'restart', { yes }))) return;
   await stopHostCmd(id, { silent: true });   // now waits until the whole tree is dead
   const pid = spawnDaemon(id, { ...h, pid: undefined, stopped: false }, { fg: false });
   reg.update(id, { stopped: false });
@@ -337,6 +465,7 @@ async function shutdownAll() {
 
 // Clear a budget pause on a running host (SIGUSR1 — the daemon resets its window).
 function resumeHost(id) {
+  id = resolveId(id);
   const h = reg.get(id);
   if (!h) die(`no such host: ${id}`);
   if (!h.pid || !kill(h.pid, 'SIGUSR1')) die(`host ${id} is not running`);
@@ -344,6 +473,7 @@ function resumeHost(id) {
 }
 
 function budgetCmd(id, args) {
+  id = resolveId(id);
   const h = reg.get(id);
   if (!h) die(`no such host: ${id}`);
   if (args.includes('--reset')) return resumeHost(id);
@@ -508,6 +638,8 @@ async function imCmd(args) {
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
+const positional = rest.filter((a) => !a.startsWith('-'));               // ids/labels, flags stripped
+const yes = rest.includes('--yes') || rest.includes('-y') || rest.includes('--force');
 // Crash-path backstop, but ONLY before mutating lifecycle commands — a read-only
 // `list`/`status`/`logs`/`help` must never have a destructive side effect. (`prune`
 // does its own reap.) The reap itself is identity-guarded against PID reuse.
@@ -518,11 +650,14 @@ switch (cmd) {
   case 'logout': logout(rest); break;
   case 'im': await imCmd(rest); break;
   case 'list': case 'ls': listHosts(); break;
+  case 'bindings': listBindings(); break;
   case 'status': rest[0] ? statusHost(rest[0]) : die('usage: concord status <id>'); break;
   case 'logs': rest[0] ? logsHost(rest[0], rest.includes('-f') || rest.includes('--follow')) : die('usage: concord logs <id> [-f]'); break;
-  case 'stop': rest[0] ? await stopHostCmd(rest[0]) : die('usage: concord stop <id>'); break;
-  case 'restart': rest[0] ? await restartHost(rest[0]) : die('usage: concord restart <id>'); break;
-  case 'rm': rest[0] ? await rmHost(rest[0]) : die('usage: concord rm <id>'); break;
+  case 'open': positional[0] ? openRoom(positional[0]) : die('usage: concord open <id>'); break;
+  case 'label': positional[0] && positional[1] ? labelHost(positional[0], positional[1]) : die('usage: concord label <id> <label>'); break;
+  case 'stop': positional[0] ? await stopHostCmd(positional[0], { yes }) : die('usage: concord stop <id> [--yes]'); break;
+  case 'restart': positional[0] ? await restartHost(positional[0], { yes }) : die('usage: concord restart <id> [--yes]'); break;
+  case 'rm': positional[0] ? await rmHost(positional[0], { yes }) : die('usage: concord rm <id> [--yes]'); break;
   case 'prune': await prune(); break;
   case 'shutdown': await shutdownAll(); break;
   case 'resume': rest[0] ? resumeHost(rest[0]) : die('usage: concord resume <id>'); break;

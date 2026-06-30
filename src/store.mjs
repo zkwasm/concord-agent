@@ -74,6 +74,14 @@ export function openStore(filePath) {
     getAdapterPid() { return state.adapterPid ?? null; },
     setAdapterPid(pid, start = null) { state.adapterPid = pid || null; state.adapterStart = pid ? (start || null) : null; persist(); },
 
+    // --- live host runtime, surfaced by `concord list`/`status` (the CLI reads these
+    //     raw from state.json). activity: what the agent is doing right now; paused: a
+    //     hard-pause reason (repeated timeouts); exit: why the supervisor last died.
+    //     Together they turn an opaque "running"/"crashed" into a legible state. ---
+    setActivity(workState, label = null, at = Date.now()) { state.activity = { state: workState, label, at }; persist(); },
+    setPaused(reason, at = Date.now()) { state.paused = reason ? { reason, at } : null; persist(); },
+    setExit(reason, at = Date.now()) { state.exit = reason ? { reason, at } : null; persist(); },
+
     // --- per-agent (per-room) token accounting, for stats + budget guard ---
     getUsage(roomId) { return { ...usageState(roomId) }; },
     addUsage(roomId, fresh, cached, now) {
