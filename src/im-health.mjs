@@ -10,8 +10,12 @@ const SEV_RANK = { critical: 0, high: 1, medium: 2, low: 3, ok: 4 };
 // 'flowing' = connected + recent events; 'quiet' = connected, nobody talking (HEALTHY — must
 // NEVER read as a fault); 'suspect' = not actually connected. lastEventAt/now are ms.
 export function eventPlaneStatus(connState, lastEventAt, now, flowingWindowMs = 10 * 60 * 1000) {
+  // Receiving inbound PROVES the connection works — it overrides a stale/wrong connState
+  // (the SDK's getConnectionStatus is confirmed to exist but its live behavior is unverified,
+  // so don't let a quirky 'idle' false-alarm an actively-used binding).
+  if (lastEventAt && now - lastEventAt < flowingWindowMs) return 'flowing';
   if (connState !== 'connected') return 'suspect';
-  return lastEventAt && now - lastEventAt < flowingWindowMs ? 'flowing' : 'quiet';
+  return 'quiet';
 }
 
 // The single most-broken link for ONE binding → a human next-action, or null if healthy.

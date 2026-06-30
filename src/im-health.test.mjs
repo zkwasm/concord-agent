@@ -11,8 +11,13 @@ test('eventPlaneStatus: quiet (connected, no recent events) is HEALTHY, never su
   assert.equal(eventPlaneStatus('connected', 0, NOW), 'quiet');                     // never any event but connected → quiet
 });
 
-test('eventPlaneStatus: anything not connected → suspect', () => {
-  for (const s of ['idle', 'connecting', 'reconnecting', 'failed']) assert.equal(eventPlaneStatus(s, NOW, NOW), 'suspect');
+test('eventPlaneStatus: not connected AND no recent events → suspect', () => {
+  for (const s of ['idle', 'connecting', 'reconnecting', 'failed']) assert.equal(eventPlaneStatus(s, 0, NOW), 'suspect');
+});
+
+test('eventPlaneStatus: recent inbound overrides a stale connState (actively-used binding never false-alarms)', () => {
+  assert.equal(eventPlaneStatus('idle', NOW - 5000, NOW), 'flowing');     // SDK says idle but we ARE getting events → flowing
+  assert.equal(eventPlaneStatus('failed', NOW - 5000, NOW), 'flowing');
 });
 
 test('bindingNextAction: worst-first ordering (blocked > room-gone > no-agent > paused > down)', () => {
