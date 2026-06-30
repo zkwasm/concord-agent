@@ -385,7 +385,19 @@ async function loginViaQR(platform) {
   saveCreds(platform, { appId: reg.client_id, appSecret: reg.client_secret, domain });
   console.log(`\n✓ 已保存 ${platform} 凭据 → ~/.concord/creds.json (0600)`);
   console.log(`  appId: ${reg.client_id}  ·  domain: ${domain}`);
-  console.log('\n下一步:`concord im` 启动 IM owner;然后在聊天里发 /concord-bind 绑定。');
+  // Auto-start the IM owner — without it the bot has creds but nothing's listening, so
+  // a `/concord-bind` in the chat goes nowhere. Skip if one's already running (rebinding
+  // a chat with new creds shouldn't double-spawn). Errors here are non-fatal — the user
+  // has working creds either way and can fall back to `concord im` manually.
+  try {
+    const { pid, started } = startImOwnerIfNeeded(platform, undefined);
+    if (started) console.log(`✓ IM owner 已启动 (pid ${pid}) — 现在去聊天里发 /concord-bind 就行。`);
+    else console.log(`✓ IM owner 已在运行 (pid ${pid}) — 直接去聊天里发 /concord-bind 即可。`);
+    console.log('   日志:  concord logs ' + imOwnerId(platform));
+  } catch (e) {
+    console.log('\n⚠️  自动启动 IM owner 失败:' + (e?.message || e));
+    console.log('   手动起一下:  concord im');
+  }
 }
 
 async function login(args) {
@@ -412,6 +424,22 @@ function logout(args) {
 // `concord im` — the IM owner daemon: owns the bot's single WSClient + relays bound
 // chats. ONE per bot (single-instance). `concord im stop|status|logs` manage it.
 const imOwnerId = (platform) => `im-${platform}`;
+
+// Spawn the IM owner daemon for a platform (background, detached). Returns the running
+// pid + whether we just started it or it was already up. Used by both `concord im` and
+// `concord login --qr` (which auto-starts the owner so the user is done in one command).
+function startImOwnerIfNeeded(platform, url) {
+  const id = imOwnerId(platform);
+  const existing = reg.get(id);
+  if (existing && existing.pid && kill(existing.pid, 0)) return { pid: existing.pid, started: false };
+  const env = { ...process.env, ...(url ? { CONCORD_URL: url } : {}) };
+  mkdirSync(reg.hostDir(id), { recursive: true });
+  const out = openSync(join(reg.hostDir(id), 'log'), 'a');
+  const child = spawn(process.execPath, [OWNER, platform], { detached: true, stdio: ['ignore', out, out], env });
+  child.unref();
+  reg.register({ id, mode: 'im', platform, agent: '-', room: '-', pid: child.pid, log: join(reg.hostDir(id), 'log') });
+  return { pid: child.pid, started: true };
+}
 async function imCmd(args) {
   const { positional } = parseArgs(args);
   const sub = positional[0];
@@ -428,21 +456,19 @@ async function imCmd(args) {
   const id = imOwnerId(platform);
   const existing = reg.get(id);
   if (existing && existing.pid && kill(existing.pid, 0)) die(`a concord im owner for ${platform} is already running (id ${id}, pid ${existing.pid}). One bot = one owner — stop it first: concord im stop`);
-  const env = { ...process.env, CONCORD_URL: cfg.url };
-  const a = [OWNER, platform];
+  // --fg keeps the owner attached (stdio inherited) — useful for debugging the WSClient
+  // handshake. The default background path goes through startImOwnerIfNeeded so the
+  // detached spawn / registry write is the same as the `concord login --qr` auto-start.
   if (args.includes('--fg')) {
     reg.register({ id, mode: 'im', platform, agent: '-', room: '-' });
-    const child = spawn(process.execPath, a, { stdio: 'inherit', env });
+    const env = { ...process.env, CONCORD_URL: cfg.url };
+    const child = spawn(process.execPath, [OWNER, platform], { stdio: 'inherit', env });
     reg.update(id, { pid: child.pid });
     child.on('close', () => reg.update(id, { pid: null, stopped: true }));
     return;
   }
-  mkdirSync(reg.hostDir(id), { recursive: true });
-  const out = openSync(join(reg.hostDir(id), 'log'), 'a');
-  const child = spawn(process.execPath, a, { detached: true, stdio: ['ignore', out, out], env });
-  child.unref();
-  reg.register({ id, mode: 'im', platform, agent: '-', room: '-', pid: child.pid, log: join(reg.hostDir(id), 'log') });
-  console.log(`✓ im owner started — ${platform} · id ${id} · pid ${child.pid}\n  concord logs ${id}   ·   concord im stop`);
+  const { pid } = startImOwnerIfNeeded(platform, cfg.url);
+  console.log(`✓ im owner started — ${platform} · id ${id} · pid ${pid}\n  concord logs ${id}   ·   concord im stop`);
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
