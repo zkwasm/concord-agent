@@ -1,6 +1,6 @@
 {
   "name": "concord-agent",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Host a coding agent (claude/codex/gemini/…) in a Concord room over ACP. Resident session, idle = zero tokens, token budget, IM control.",
   "type": "module",
   "bin": {
@@ -21,7 +21,8 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "0.28.1",
-    "@larksuiteoapi/node-sdk": "^1.68.0"
+    "@larksuiteoapi/node-sdk": "^1.68.0",
+    "qrcode-terminal": "^0.12.0"
   },
   "keywords": [
     "concord",

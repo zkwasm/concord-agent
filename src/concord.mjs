@@ -41,7 +41,8 @@ Usage:
   concord im [stop|status|logs]      IM owner: owns your bot + relays bound chats (one per bot)
   concord host <agent> --bind <chat_id> [--budget N] [--force]
       Bind an IM chat (sent /concord-bind there) to a fresh agent; the owner routes it here.
-  concord login lark|feishu --app-id <id> [--app-secret <s>]   Store your own bot creds (0600)
+  concord login lark|feishu --qr                  Scan a QR in the app to create + log in the bot (recommended; no developer console)
+  concord login lark|feishu --app-id <id> [--app-secret <s>]   Store your own bot creds manually (0600)
   concord logout [lark|feishu]       Remove stored creds
   concord list                       List hosted agents
   concord status <id>                Detail for one host
@@ -79,7 +80,7 @@ function resolveImPlatform(cfg, mode) {
   if (mode !== 'host') return null;
   if (cfg.im) {
     if (!IM_PLATFORMS.includes(cfg.im)) die(`--im must be one of: ${IM_PLATFORMS.join(' | ')}`);
-    if (!getCreds(cfg.im)) die(`no ${cfg.im} credentials — run:  concord login ${cfg.im} --app-id <id> --app-secret <secret>`);
+    if (!getCreds(cfg.im)) die(`no ${cfg.im} credentials.\n  Easiest:   concord login ${cfg.im} --qr     (scan a QR in the app, no developer console)\n  Manual:    concord login ${cfg.im} --app-id <id> --app-secret <secret>`);
     return cfg.im;
   }
   const loggedIn = IM_PLATFORMS.filter((p) => getCreds(p));
@@ -158,7 +159,7 @@ async function startHost(mode, args) {
   let bound = false;
   if (cfg.bind) {
     const platform = resolveImPlatform(cfg, 'host');
-    if (!platform) die('--bind needs a logged-in IM platform — run: concord login lark --app-id <id> --app-secret <secret>');
+    if (!platform) die('--bind needs a logged-in IM platform — easiest: `concord login lark --qr` (scan a QR; no developer console). Or use `--app-id`/`--app-secret`.');
     const res = openBindings().bind(platform, cfg.bind, { roomId: room, agent: cfg.agent, cwd }, { force: cfg.force });
     if (!res.ok) die(`chat ${cfg.bind} is already bound to room ${shortRoom(res.existing.roomId)} — add --force to rebind`);
     bound = true;
@@ -353,13 +354,49 @@ function budgetCmd(id, args) {
 
 // Store this user's OWN IM bot creds locally (0600). Secret via --app-secret or,
 // to keep it out of shell history, piped on stdin.
+// Scan a QR in Feishu/Lark to create the bot app and save its creds — zero developer-
+// console clicks. Uses registerApp from @larksuiteoapi/node-sdk (same dep we already
+// have) — the standard OAuth 2.0 Device Authorization flow with Feishu's PersonalAgent
+// archetype, which provisions the bot with the message/card/event scopes the IM owner
+// needs and auto-detects feishu vs. lark from the scanning user's tenant.
+async function loginViaQR(platform) {
+  const { registerApp } = await import('@larksuiteoapi/node-sdk');
+  const qrcode = (await import('qrcode-terminal')).default;
+  console.log(`\n用「${platform === 'lark' ? 'Lark' : '飞书'}」App 扫码创建你的 bot 应用 — 不用开发者后台、不用发版。\n`);
+  let reg;
+  try {
+    reg = await registerApp({
+      source: 'concord-agent',
+      createOnly: true,
+      appPreset: { name: 'Concord · {user}' },   // {user} = the scanning user's name
+      onQRCodeReady: ({ url, expireIn }) => {
+        qrcode.generate(url, { small: true });
+        console.log(`\n二维码有效期约 ${Math.max(1, Math.round(expireIn / 60))} 分钟。`);
+        console.log(`扫不动也可在浏览器打开:${url}\n`);
+        console.log('等你在 App 里点完「同意」…');
+      },
+      onStatusChange: ({ status }) => { if (status === 'domain_switched') console.log('  (识别到 Lark 国际版,已自动切换)'); },
+    });
+  } catch (e) {
+    die(`扫码登录失败:${e?.message || e}`);
+  }
+  // tenant_brand决定走哪个域(lark/feishu);存到 creds 里供 owner 直接用
+  const domain = reg.user_info?.tenant_brand === 'lark' ? 'lark' : 'feishu';
+  saveCreds(platform, { appId: reg.client_id, appSecret: reg.client_secret, domain });
+  console.log(`\n✓ 已保存 ${platform} 凭据 → ~/.concord/creds.json (0600)`);
+  console.log(`  appId: ${reg.client_id}  ·  domain: ${domain}`);
+  console.log('\n下一步:`concord im` 启动 IM owner;然后在聊天里发 /concord-bind 绑定。');
+}
+
 async function login(args) {
   const { flags, positional } = parseArgs(args);
   const platform = positional[0];
-  if (!['lark', 'feishu'].includes(platform)) die('usage: concord login lark|feishu --app-id <id> [--app-secret <secret>]');
+  if (!['lark', 'feishu'].includes(platform)) die('usage: concord login lark|feishu [--qr | --app-id <id> [--app-secret <secret>]]');
+  // --qr: zero-config bot creation via scanning a QR with the Feishu/Lark app.
+  if (flags.qr === true || args.includes('--qr')) { await loginViaQR(platform); return; }
   const appId = flags['app-id'];
   let appSecret = flags['app-secret'];
-  if (!appId) die('--app-id is required');
+  if (!appId) die('--app-id is required (or use --qr to scan a QR and create the app for you)');
   if (!appSecret && !process.stdin.isTTY) appSecret = readFileSync(0, 'utf8').trim();   // piped: `… | concord login`
   if (!appSecret) die('--app-secret is required (or pipe it on stdin to keep it out of history)');
   saveCreds(platform, { appId, appSecret, domain: platform });
@@ -387,7 +424,7 @@ async function imCmd(args) {
   }
   const cfg = resolveConfig(args, process.env);
   const platform = resolveImPlatform(cfg, 'host');
-  if (!platform) die('no IM platform logged in — run: concord login lark --app-id <id> --app-secret <secret>');
+  if (!platform) die('no IM platform logged in — easiest: `concord login lark --qr` (scan a QR; no developer console). Or use `--app-id`/`--app-secret`.');
   const id = imOwnerId(platform);
   const existing = reg.get(id);
   if (existing && existing.pid && kill(existing.pid, 0)) die(`a concord im owner for ${platform} is already running (id ${id}, pid ${existing.pid}). One bot = one owner — stop it first: concord im stop`);

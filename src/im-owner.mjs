@@ -254,7 +254,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const platform = process.argv[2] || 'lark';
   const c = loadCreds()[platform];
-  if (!c?.appId || !c?.appSecret) { console.error(`✗ no ${platform} creds — run: concord login ${platform} --app-id <id> --app-secret <secret>`); process.exit(1); }
+  if (!c?.appId || !c?.appSecret) { console.error(`✗ no ${platform} creds — easiest: \`concord login ${platform} --qr\` (scan a QR; no developer console). Or use --app-id/--app-secret.`); process.exit(1); }
   const owner = createOwner({ platform, appId: c.appId, appSecret: c.appSecret, domain: c.domain, url: process.env.CONCORD_URL, log: console.log });
   process.on('SIGTERM', () => { owner.shutdown(); process.exit(0); });
   process.on('SIGINT', () => { owner.shutdown(); process.exit(0); });
