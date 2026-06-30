@@ -43,7 +43,7 @@ function freshOwner({ userCount } = {}) {
   const client = mockClient({ userCount });
   const captured = { posts: [] };
   const store = openBindings(root);
-  const owner = createOwner({ platform: 'lark', url: 'http://test', log: () => {}, bindings: store, _clients: { client, ws: fakeWs, fetch: mockFetch(captured) } });
+  const owner = createOwner({ platform: 'lark', url: 'http://test', log: () => {}, bindings: store, home: root, _clients: { client, ws: fakeWs, fetch: mockFetch(captured) } });
   return { owner, client, store, captured, cleanup: () => { owner.shutdown(); rmSync(root, { recursive: true, force: true }); } };
 }
 

@@ -23,6 +23,7 @@ import { saveCreds, removeCreds, loadCreds, getCreds } from './creds.mjs';
 import { openBindings } from './im-bindings.mjs';
 import { fetchRoomName } from './room-meta.mjs';
 import { ownerAction } from './owner-lifecycle.mjs';
+import { overallHeadline, bindingVerdict, bindingNextAction } from './im-health.mjs';
 
 const IM_PLATFORMS = ['lark', 'feishu'];
 
@@ -289,10 +290,14 @@ function listBindings() {
   const live = reg.list();
   const liveRooms = new Set(live.filter((h) => h.alive).map((h) => h.room));
   const nameByRoom = new Map(live.filter((h) => h.roomName).map((h) => [h.room, h.roomName]));
+  // Prefer the owner's end-to-end health verdict (connection→room→agent) over the local
+  // "is there a live host" heuristic; fall back when no snapshot (owner down / pre-reconcile).
+  const verdictByChat = new Map();
+  for (const p of IM_PLATFORMS) for (const sb of readHealth(p)?.bindings || []) verdictByChat.set(`${p}:${sb.chatId}`, bindingVerdict(sb));
   const row = (c) => `${padCol(c[0], 8)} ${padCol(c[1], 20)} ${padCol(c[2], 7)} ${padCol(c[3], 20)} ${padCol(c[4], 8)} ${c[5]}`;
   console.log(row(['PLATFORM', 'CHAT', 'TYPE', 'ROOM', 'AGENT', 'HEALTH']));
   for (const b of all) {
-    const health = liveRooms.has(b.roomId) ? 'ok' : '⚠ no live host';
+    const health = verdictByChat.get(`${b.platform}:${b.chatId}`) || (liveRooms.has(b.roomId) ? 'ok' : '⚠ no live host');
     console.log(row([b.platform || '-', truncWidth(b.chatName || b.chatId || '-', 20), b.chatType || '-', truncWidth(nameByRoom.get(b.roomId) || shortRoom(b.roomId), 20), b.agent || '-', health]));
   }
 }
@@ -627,14 +632,49 @@ async function startImOwnerIfNeeded(platform, url, { startIfAbsent = true } = {}
   reg.register({ id, mode: 'im', platform, appId: wantAppId, agent: '-', room: '-', pid: child.pid, log: join(reg.hostDir(id), 'log') });
   return { pid: child.pid, started: true, restarted: action === 'restart', appId: wantAppId };
 }
+// The IM owner's self-written health snapshot (~/.concord/hosts/im-<platform>/health.json).
+function readHealth(platform) {
+  try { return JSON.parse(readFileSync(join(reg.hostDir(imOwnerId(platform)), 'health.json'), 'utf8')); } catch { return null; }
+}
+
+// `concord im status` — render the owner's end-to-end health (connection · per-binding agent/
+// room state · the single next action). Also the one place a drifted owner gets repaired:
+// it's connected to the WRONG app, so its in-band "restart me" can't reach the user — the CLI
+// is the only working channel (D4).
+async function imStatus() {
+  const platforms = IM_PLATFORMS.filter((p) => getCreds(p));
+  if (!platforms.length) { console.log('(no IM platform logged in — `concord login lark --qr`)'); return; }
+  for (const platform of platforms) {
+    const id = imOwnerId(platform);
+    let h = reg.get(id);
+    if (h && h.pid && kill(h.pid, 0)) {
+      try { const r = await startImOwnerIfNeeded(platform, undefined, { startIfAbsent: false }); if (r.restarted) console.log(`✓ owner 检测到 creds 切换,已重启到当前 app (pid ${r.pid})`); } catch { /* non-fatal */ }
+      h = reg.get(id);
+    }
+    const alive = h && h.pid && kill(h.pid, 0);
+    console.log(`\n══ IM owner · ${platform} ══`);
+    if (!alive) { console.log(`  ✗ owner 没在运行 —— 启动:concord login ${platform} --qr   (或 concord im)`); continue; }
+    const snap = readHealth(platform);
+    if (!snap) { console.log(`  owner 在跑 (pid ${h.pid}),但还没写出健康快照 —— 等一个对账周期(~45s)再看。`); continue; }
+    console.log(`  ${overallHeadline(snap).summary}`);
+    console.log(`  app ${snap.appId || '-'} · 长连接 ${snap.eventPlane?.state || '?'}/${snap.eventPlane?.status || '?'} · 对账 ${snap.reconciledAt ? ago(snap.reconciledAt) : '?'}前`);
+    if (!snap.bindings?.length) { console.log('  (还没有绑定 —— 在聊天里发 /concord-bind)'); continue; }
+    for (const b of snap.bindings) {
+      console.log(`  · ${b.chatName || b.chatId} → ${b.roomName || shortRoom(b.roomId)}  [${bindingVerdict(b)}]`);
+      const na = bindingNextAction(b);
+      if (na && na.cmd) console.log(`      ${na.summary}  →  ${na.cmd}`);
+    }
+  }
+}
+
 async function imCmd(args) {
   const { positional } = parseArgs(args);
   const sub = positional[0];
-  if (sub === 'stop' || sub === 'status' || sub === 'logs') {
+  if (sub === 'status') return imStatus();
+  if (sub === 'stop' || sub === 'logs') {
     const o = reg.list().find((h) => h.mode === 'im');
     if (!o) die('no `concord im` owner is registered');
     if (sub === 'stop') return stopHostCmd(o.id);
-    if (sub === 'status') return statusHost(o.id);
     return logsHost(o.id, args.includes('-f') || args.includes('--follow'));
   }
   const cfg = resolveConfig(args, process.env);

@@ -9,13 +9,18 @@
 //
 // Inbound brain is pure (im-routing.classifyInbound); HTTP is injectable for tests.
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { watch } from 'node:fs';
-import { dirname } from 'node:path';
+import { watch, writeFileSync, renameSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 import { loadCreds } from './creds.mjs';
 import { openBindings } from './im-bindings.mjs';
 import { classifyInbound } from './im-routing.mjs';
 import { cleanText } from './im-lark.mjs';
 import { shouldUseCard, buildCard } from './im-render.mjs';
+import { eventPlaneStatus, chatBreadcrumbs } from './im-health.mjs';
+
+const CONCORD_HOME = process.env.CONCORD_HOME || join(homedir(), '.concord');
+const TRIG_RANK = { watch: 3, connect: 2, tick: 1, start: 0 };
 
 const DOMAINS = { lark: Lark.Domain.Lark, feishu: Lark.Domain.Feishu };
 const GROUP_DEFAULT_BUDGET = 1000000;   // a group binding defaults to this (the only token gate once "anyone triggers")
@@ -23,15 +28,32 @@ const RELAY_SENDER = 'IM';              // the owner's identity in each bound ro
 const short = (r) => (r ? String(r).slice(0, 8) : '-');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export function createOwner({ platform = 'lark', appId, appSecret, domain, url, log = console.log, bindings, _clients = null } = {}) {
+export function createOwner({ platform = 'lark', appId, appSecret, domain, url, log = console.log, bindings, home = CONCORD_HOME, _clients = null } = {}) {
   const dom = DOMAINS[domain] || DOMAINS[platform] || Lark.Domain.Lark;
+  const bakedAppId = appId || null;     // the app this owner is pinned to — for creds-drift detection
   const client = _clients?.client || new Lark.Client({ appId, appSecret, domain: dom });
-  const ws = _clients?.ws || new Lark.WSClient({ appId, appSecret, domain: dom, loggerLevel: Lark.LoggerLevel.warn });
+  // Connection state from the SDK (getConnectionStatus + these callbacks) makes event-plane
+  // health a REAL signal, not a "no events lately" guess. The owner never registered these
+  // before, so a failed handshake / silent reconnect was invisible.
+  let connState = 'idle';               // idle|connecting|connected|reconnecting|failed
+  let lastEventAt = 0;
+  const onConn = (s) => { connState = s; try { reconcile('connect'); } catch { /* non-fatal */ } };
+  const ws = _clients?.ws || new Lark.WSClient({
+    appId, appSecret, domain: dom, loggerLevel: Lark.LoggerLevel.warn,
+    onReady: () => { onConn('connected'); log('[owner] WSClient ready'); },
+    onError: (e) => { connState = 'failed'; log('[owner] WSClient error: ' + (e?.message || e)); },
+    onReconnecting: () => { connState = 'reconnecting'; },
+    onReconnected: () => { onConn('connected'); },
+  });
   const fetchImpl = _clients?.fetch || globalThis.fetch;
   const CONCORD_URL = url || process.env.CONCORD_URL || 'https://concord.fenginwind.com';
   const store = bindings || openBindings();
   const seen = new Set();         // in-process dedup (Lark resends until acked)
-  const rooms = new Map();        // roomId → { sessionId, chatId, polling }
+  const rooms = new Map();        // roomId → { sessionId, chatId, polling, roomStatus, consec401, lastRelayAt, lastAgentState }
+  const blockedRooms = new Set(); // roomId whose relay name is taken by a ghost (dual-409) — surfaced as 'blocked'
+  // reconcile coalescing + health snapshot
+  let reconciling = false, pendingTrigger = null, prevSnapshot = null, tickN = 0;
+  const HEALTH_PATH = join(home, 'hosts', `im-${platform}`, 'health.json');
 
   // ---- IM side: send to a chat (interactive card, plain-text fallback) ----
   async function send(chatId, text) {
@@ -108,15 +130,28 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   // note) goes to the bound IM chat. Skipping our own relay sender is the loop guard.
   async function pollRoom(roomId) {
     const rc = rooms.get(roomId);
+    let backoff = 2000;
+    // pollRoom runs OUTSIDE the reconcile gate (detached promise); it records room health into
+    // rc so reconcile reads it for free (zero extra request). 401-streak → quiesce (rebind to
+    // recover); durable 404/410 → room gone, quiesce; 429 → rate-limited, not "unreachable".
     while (rc && rc.polling) {
       try {
         const res = await fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/messages?session=${rc.sessionId}&wait=30`);
-        if (res.status === 401) { const j = await roomJoin(roomId); rc.sessionId = j.sessionId; rc.relaySender = j.sender; continue; }
+        if (res.status === 401) {
+          rc.consec401 = (rc.consec401 || 0) + 1;
+          if (rc.consec401 >= 5) { rc.roomStatus = 'unreachable'; rc.polling = false; log(`relay ${short(roomId)}: 5× 401 — quiescing (rebind to recover)`); break; }
+          const j = await roomJoin(roomId); rc.sessionId = j.sessionId; rc.relaySender = j.sender; continue;
+        }
+        if (res.status === 404 || res.status === 410) { rc.roomStatus = 'unreachable'; rc.polling = false; log(`relay ${short(roomId)}: room gone (${res.status}) — quiescing`); break; }
+        if (res.status === 429) { rc.roomStatus = 'rate-limited'; await sleep(backoff); backoff = Math.min(backoff * 2, 30000); continue; }
+        if (!res.ok) { rc.roomStatus = 'unreachable'; await sleep(backoff); backoff = Math.min(backoff * 2, 30000); continue; }
+        rc.roomStatus = 'reachable'; rc.consec401 = 0; backoff = 2000;
         for (const m of (await res.json()).messages || []) {
           if (m.sender === rc.relaySender) continue;        // our own injected user message → don't echo back
+          rc.lastRelayAt = Date.now();
           await send(rc.chatId, m.content);                 // agent reply/progress → the IM chat
         }
-      } catch (e) { log('relay poll error: ' + e.message); await sleep(2000); }
+      } catch (e) { log('relay poll error: ' + e.message); rc.roomStatus = rc.roomStatus || 'unknown'; await sleep(backoff); backoff = Math.min(backoff * 2, 30000); }
     }
   }
   async function ensureRoom(roomId, chatId) {
@@ -185,6 +220,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   }
 
   async function onEvent(data) {
+    lastEventAt = Date.now();   // event-plane liveness: we are receiving inbound from Lark
     const m = data?.message || {};
     const id = m.message_id;
     if (id && seen.has(id)) return { action: 'dup' };
@@ -221,33 +257,122 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
       if (rooms.has(b.roomId)) continue;
       try {
         await ensureRoom(b.roomId, b.chatId);
+        blockedRooms.delete(b.roomId);
         if (notify) await send(b.chatId, introText(b, await resolveRoomName(b.roomId)));
       } catch (e) {
         log('relay start failed: ' + e.message);
+        if (/name taken/i.test(e.message)) blockedRooms.add(b.roomId);   // dual-409: a ghost holds the relay name → 'blocked', not a silent retry
         if (notify) await send(b.chatId, `⚠️ 绑定失败:连不上房间(${String(e.message).slice(0, 80)})。`);
       }
     }
     for (const [roomId, rc] of rooms) if (!bound.has(roomId)) { rc.polling = false; rooms.delete(roomId); log(`relay down: room ${short(roomId)} (unbound)`); await send(rc.chatId, '⚠️ 本聊天的 agent 已移除。发 **/concord-bind** 可重新绑定。').catch(() => {}); }
   }
 
+  // ---- reconcile: align desired (bindings) vs actual (relay/conn/room/agent), self-correct
+  //      or surface, write the health snapshot the CLI reads. Coalescing + non-fatal. ----
+  async function fetchT(url, ms = 4000) {
+    const ac = new AbortController(); const t = setTimeout(() => ac.abort(), ms);
+    try { return await fetchImpl(url, { signal: ac.signal }); } finally { clearTimeout(t); }
+  }
+  // Is there a live non-relay agent in the room? Uses the room-token GET /agent/rooms/:id/agents
+  // (added for this). 404 → 'unknown' (room gone OR endpoint not deployed yet) — never falsely 'absent'.
+  async function agentPresence(roomId, relaySender) {
+    try {
+      const r = await fetchT(`${CONCORD_URL}/agent/rooms/${roomId}/agents`);
+      if (!r.ok) return 'unknown';
+      const agents = (await r.json())?.agents || [];
+      const others = agents.filter((n) => n !== RELAY_SENDER && n !== relaySender);
+      return others.length > 0 ? 'present' : 'absent';
+    } catch { return 'unknown'; }
+  }
+  // Round-robin deep checks on large fleets so the per-room API budget (60/min/room) is safe.
+  function shouldDeepCheck(roomId, fleetSize) {
+    if (fleetSize <= 4) return true;
+    let h = 0; for (const c of String(roomId)) h = (h + c.charCodeAt(0)) % 3;
+    return h === tickN % 3;
+  }
+  function writeSnapshot(snap) {
+    try { mkdirSync(dirname(HEALTH_PATH), { recursive: true }); const tmp = HEALTH_PATH + '.tmp'; writeFileSync(tmp, JSON.stringify(snap, null, 2)); renameSync(tmp, HEALTH_PATH); }
+    catch (e) { log('[owner] snapshot write failed: ' + e.message); }
+  }
+  function loadPrevSnapshot() { try { return JSON.parse(readFileSync(HEALTH_PATH, 'utf8')); } catch { return null; } }
+  // Singleton guard: if the registry's owner pid for this platform is no longer us, another
+  // owner took over (the spawn-time lock should prevent it, but this is the runtime backstop).
+  function stillOwner() {
+    try {
+      const p = join(home, 'hosts.json');
+      if (!existsSync(p)) return true;
+      const e = JSON.parse(readFileSync(p, 'utf8'))[`im-${platform}`];
+      if (!e || e.pid == null) return true;
+      return e.pid === process.pid;
+    } catch { return true; }   // never step down on a read error
+  }
+  function stepDown() { try { for (const rc of rooms.values()) rc.polling = false; ws.close?.({ force: true }); } catch { /* */ } process.exit(0); }
+
+  async function reconcileOnce(trigger) {
+    if (!stillOwner()) { log(`[owner] another owner now owns ${platform} — stepping down`); stepDown(); return; }
+    await syncRelays({ notify: trigger === 'watch' });                  // self-correct relays (binding↔relay)
+    try { const s = ws.getConnectionStatus?.(); if (s?.state) connState = s.state; } catch { /* SDK may not expose at all states */ }
+    const now = Date.now();
+    const mine = Object.values(store.list()).filter((b) => b.platform === platform);   // read bindings ONCE
+    const credsAppId = (() => { try { return loadCreds(home)[platform]?.appId || null; } catch { return null; } })();
+    const credsDrift = bakedAppId && credsAppId && credsAppId !== bakedAppId ? { fileAppId: credsAppId, bakedAppId } : false;
+    const bindingsSnap = [];
+    for (const b of mine) {
+      const rc = rooms.get(b.roomId);
+      const relay = blockedRooms.has(b.roomId) ? 'blocked' : rc?.polling ? 'up' : 'down';
+      const room = rc?.roomStatus || 'unknown';
+      let agentState = rc?.lastAgentState || 'unknown';
+      if (shouldDeepCheck(b.roomId, mine.length)) { agentState = await agentPresence(b.roomId, rc?.relaySender); if (rc) rc.lastAgentState = agentState; }
+      bindingsSnap.push({ chatId: b.chatId, chatName: b.chatName || null, roomId: b.roomId, agent: b.agent || null, relay, room, agentState, lastRelayAt: rc?.lastRelayAt || 0 });
+    }
+    const snap = {
+      platform, appId: bakedAppId, ownerPid: process.pid, state: 'running', reconciledAt: now,
+      controlPlane: { lark: connState === 'failed' ? 'fail' : 'ok', concord: 'unknown' },
+      eventPlane: { state: connState, lastEventAt, status: eventPlaneStatus(connState, lastEventAt, now) },
+      credsDrift, bindings: bindingsSnap,
+    };
+    try {
+      const whileDown = trigger === 'start';                            // first reconcile after (re)start
+      for (const bc of chatBreadcrumbs(prevSnapshot, snap, { whileDown })) await send(bc.chatId, bc.message).catch(() => {});
+    } catch (e) { log('[owner] breadcrumb error: ' + e.message); }
+    writeSnapshot(snap);
+    prevSnapshot = snap;
+    tickN++;
+  }
+  async function reconcile(trigger) {
+    if (reconciling) { pendingTrigger = (TRIG_RANK[trigger] ?? 0) > (TRIG_RANK[pendingTrigger] ?? -1) ? trigger : pendingTrigger; return; }
+    reconciling = true;
+    try { await reconcileOnce(trigger); }
+    catch (e) { log('[owner] reconcile error (non-fatal): ' + (e?.message || e)); }
+    finally { reconciling = false; const next = pendingTrigger; pendingTrigger = null; if (next) reconcile(next); }
+  }
+
   function start() {
+    prevSnapshot = loadPrevSnapshot();   // diff baseline: transitions during downtime surface on restart (C⑥)
     const dispatcher = new Lark.EventDispatcher({}).register({ 'im.message.receive_v1': (data) => onEvent(data).catch((e) => log('[owner] inbound error: ' + e.message)) });
-    ws.start({ eventDispatcher: dispatcher });
-    syncRelays({ notify: false }).catch((e) => log('initial sync error: ' + e.message));   // existing bindings — silent
+    try { const r = ws.start({ eventDispatcher: dispatcher }); if (r?.catch) r.catch((e) => { connState = 'failed'; log('[owner] ws.start failed: ' + (e?.message || e)); }); }
+    catch (e) { connState = 'failed'; log('[owner] ws.start threw: ' + (e?.message || e)); }
+    reconcile('start').catch((e) => log('initial reconcile error: ' + e.message));
     // Watch the DIRECTORY (the bindings file may not exist yet at startup), debounced —
     // a fresh `concord host --bind` then brings the relay up AND confirms in the chat.
     let deb;
     try {
       watch(dirname(store.path), { persistent: false }, (_e, fn) => {
         if (fn && fn !== 'im-bindings.json') return;
-        clearTimeout(deb); deb = setTimeout(() => syncRelays({ notify: true }).catch((e) => log('reload error: ' + e.message)), 200);
+        clearTimeout(deb); deb = setTimeout(() => reconcile('watch'), 200);
       });
     } catch (e) { log('bindings watch unavailable: ' + e.message); }
+    setInterval(() => reconcile('tick'), 45000);   // periodic: catches drift that never touches the bindings file
     log(`✓ concord im owner up (${platform}). Private: message the bot · Group: @ the bot · send /concord-bind to bind a chat.`);
   }
-  function shutdown() { for (const rc of rooms.values()) rc.polling = false; try { ws.stop?.(); } catch { /* daemon exit closes the socket */ } }
+  function shutdown() {
+    for (const rc of rooms.values()) rc.polling = false;
+    try { ws.close?.({ force: true }); } catch { /* daemon exit closes the socket */ }   // SDK method is close({force}), not stop()
+    try { writeSnapshot({ ...(prevSnapshot || { platform, appId: bakedAppId, bindings: [] }), ownerPid: process.pid, state: 'stopped', reconciledAt: Date.now() }); } catch { /* best effort */ }
+  }
 
-  return { start, send, shutdown, onEvent, handleBind, handleUnbind, routeMessage, syncRelays };
+  return { start, send, shutdown, onEvent, handleBind, handleUnbind, routeMessage, syncRelays, reconcile, _healthPath: HEALTH_PATH };
 }
 
 // Runnable: `node src/im-owner.mjs [platform]` — load creds + start the owner.
