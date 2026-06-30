@@ -423,6 +423,13 @@ async function loginViaQR(platform, opts = {}) {
     console.log('\n⚠️  自动启动 IM owner 失败:' + (e?.message || e));
     console.log('   手动起一下:  concord im');
   }
+  // Enterprise tenants gate "personal-app creation" behind admin approval — the scan
+  // returns valid creds (and the owner connects fine) but messages won't actually route
+  // until the admin approves the new app. We can't detect this from here (creds look
+  // healthy), so flag it gently. Individual / personal accounts (the recommended path)
+  // skip this entirely.
+  console.log('\n  小提示:在企业里如果发消息没反应,可能是新应用还在等管理员审批;');
+  console.log('         批了之后不用重扫,owner 会自动跑通。详见 docs/getting-started.md §2。');
 }
 
 async function login(args) {

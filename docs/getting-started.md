@@ -54,8 +54,18 @@ That's it — credentials are local, never passed via env vars or command-line a
 - **Group:** create a group and add the bot.
 - **Private:** Lark can't start a true 1:1 with a bot from scratch — make a group with **just you + the bot**, then open the bot to DM it. (This "you + the bot" group is also exactly what the no-@ convenience in §5 needs.)
 
+> **In an enterprise tenant?** If you're not an admin of your Lark/Feishu org, the scan
+> may complete successfully but the bot stays in **pending admin approval** — credentials
+> are saved but messages won't route until your admin approves the new app in the Feishu
+> admin console. If you can't get that approval, the two easy workarounds are:
+>
+> 1. **Use a personal account instead** (free, no org required):
+>    - **Feishu (China):** install the app → register with your phone → at the use-case step pick **「个人使用」**. Re-run `concord login feishu --qr` from this account.
+>    - **Lark (international):** sign up at <https://www.larksuite.com/global/register> with email or phone. Re-run `concord login lark --qr` from this account.
+> 2. **Ask your admin to create a Custom App and hand you the App ID + Secret** — then use the manual flow in the details block below.
+
 <details>
-<summary><b>Alternative: manually create the app in the developer console</b> (use when scanning isn't possible — e.g. headless CI, or you want to reuse an existing custom app)</summary>
+<summary><b>Alternative: manually create the app in the developer console</b> (use when scanning isn't possible — e.g. headless CI, you want to reuse an existing custom app, or your tenant blocks scan-created apps)</summary>
 
 In the developer console (Lark <https://open.larksuite.com>, Feishu <https://open.feishu.cn>):
 
@@ -174,6 +184,7 @@ concord shutdown           # stop EVERYTHING — owner + all agents + clear all 
 | Symptom | Most likely cause |
 |---|---|
 | `no <platform> creds` | Run `concord login lark --qr` (or `concord login feishu --qr`) and scan |
+| Scanned successfully, creds saved, but messages don't reach the agent | In an enterprise tenant the new app may be pending **admin approval** — ask your admin to approve it, or fall back to a personal account / a manually-provisioned app (see §2). |
 | Private chat gets no response (manually-made app only) | Subscription isn't **长连接**, the **p2p read scope** is missing, or the app **version wasn't released**. The `--qr` flow avoids all three. |
 | Group only answers when @-mentioned | That's expected — unless it's a **solo group** with `im:message.group_msg` + `im:chat:readonly`. Both are included by `--qr`; if you built the app manually, add them and re-release. |
 | Solo group still needs @ (manually-made app) | Those two scopes aren't granted, or the app version wasn't re-released after adding them |
