@@ -41,7 +41,8 @@ Usage:
   concord im [stop|status|logs]      IM owner: owns your bot + relays bound chats (one per bot)
   concord host <agent> --bind <chat_id> [--budget N] [--force]
       Bind an IM chat (sent /concord-bind there) to a fresh agent; the owner routes it here.
-  concord login lark|feishu --qr                  Scan a QR in the app to create + log in the bot (recommended; no developer console)
+  concord login lark|feishu --qr [--new|--force]  Scan a QR to create + log in the bot. With existing creds: default reuses,
+                                                   --new builds a fresh app, --force re-scans to update the existing one.
   concord login lark|feishu --app-id <id> [--app-secret <s>]   Store your own bot creds manually (0600)
   concord logout [lark|feishu]       Remove stored creds
   concord list                       List hosted agents
@@ -359,15 +360,39 @@ function budgetCmd(id, args) {
 // have) — the standard OAuth 2.0 Device Authorization flow with Feishu's PersonalAgent
 // archetype, which provisions the bot with the message/card/event scopes the IM owner
 // needs and auto-detects feishu vs. lark from the scanning user's tenant.
-async function loginViaQR(platform) {
+//
+// Reuse rules (so re-running this command doesn't litter the workspace with dead apps):
+//   existing creds, no flag       → reuse, auto-start owner if needed (idempotent)
+//   --new                         → always create a fresh app (overwrites existing creds)
+//   --force                       → re-scan to update the existing app's config
+//                                   (registerApp with appId = "grant more scopes" mode)
+async function loginViaQR(platform, opts = {}) {
+  const existing = getCreds(platform);
+  if (existing && !opts.new && !opts.force) {
+    console.log(`\n✓ 已登录 ${platform}:appId ${existing.appId}(凭据已存在,跳过扫码以免重建应用)`);
+    console.log('  · 想换/补建一个新应用:  concord login ' + platform + ' --qr --new');
+    console.log('  · 想用同一应用重新扫码:  concord login ' + platform + ' --qr --force');
+    // Idempotent: still ensure the owner is up. Re-running this command becomes a
+    // safe "check + repair" — useful after a reboot that lost the daemon.
+    try {
+      const { pid, started } = startImOwnerIfNeeded(platform, undefined);
+      console.log(`\n${started ? '✓ IM owner 已启动' : '✓ IM owner 已在运行'} (pid ${pid}) — 直接去聊天发 /concord-bind 即可。`);
+    } catch (e) {
+      console.log('\n⚠️  自动启动 IM owner 失败:' + (e?.message || e));
+    }
+    return;
+  }
   const { registerApp } = await import('@larksuiteoapi/node-sdk');
   const qrcode = (await import('qrcode-terminal')).default;
-  console.log(`\n用「${platform === 'lark' ? 'Lark' : '飞书'}」App 扫码创建你的 bot 应用 — 不用开发者后台、不用发版。\n`);
+  const updateMode = opts.force && existing;
+  console.log(`\n用「${platform === 'lark' ? 'Lark' : '飞书'}」App 扫码${updateMode ? `更新已有应用 ${existing.appId}` : '创建你的 bot 应用'} — 不用开发者后台、不用发版。\n`);
   let reg;
   try {
     reg = await registerApp({
       source: 'concord-agent',
-      createOnly: true,
+      // createOnly hides the "select existing app" entry on the landing page;
+      // for --force update we DROP it (and pass appId) so the scan binds the existing app.
+      ...(updateMode ? { appId: existing.appId } : { createOnly: true }),
       appPreset: { name: 'Concord · {user}' },   // {user} = the scanning user's name
       onQRCodeReady: ({ url, expireIn }) => {
         qrcode.generate(url, { small: true });
@@ -405,7 +430,11 @@ async function login(args) {
   const platform = positional[0];
   if (!['lark', 'feishu'].includes(platform)) die('usage: concord login lark|feishu [--qr | --app-id <id> [--app-secret <secret>]]');
   // --qr: zero-config bot creation via scanning a QR with the Feishu/Lark app.
-  if (flags.qr === true || args.includes('--qr')) { await loginViaQR(platform); return; }
+  // --new = always create a fresh app; --force = re-scan to update existing app.
+  if (flags.qr === true || args.includes('--qr')) {
+    await loginViaQR(platform, { new: flags.new === true, force: flags.force === true });
+    return;
+  }
   const appId = flags['app-id'];
   let appSecret = flags['app-secret'];
   if (!appId) die('--app-id is required (or use --qr to scan a QR and create the app for you)');
