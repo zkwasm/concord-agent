@@ -11,8 +11,8 @@
 // tree is dead before reporting success; `prune` sweeps orphaned adapter groups
 // left by a crashed supervisor. No orphan token-burn. See reclaim.mjs.
 import { spawn } from 'node:child_process';
-import { openSync, createReadStream, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { openSync, createReadStream, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveConfig, parseArgs } from './cli.mjs';
 import { openRegistry, newId } from './hosts.mjs';
@@ -110,6 +110,25 @@ function spawnDaemon(id, f, { fg }) {
   return child.pid;
 }
 
+// Is the agent's CLI on PATH? The ACP adapter bundles its OWN agent runtime (the
+// big npx download), but it reads the user's `~/.<agent>/` credentials from a normal
+// install — so if the CLI isn't on PATH the user almost certainly hasn't logged in,
+// and we'd silently spend 250MB + minutes only to fail authenticating. Cheaper to
+// check up front and tell the user how to install it. Pure PATH scan, no spawn.
+const AGENT_INSTALL_HINT = {
+  claude: 'npm i -g @anthropic-ai/claude-code   (then run `claude` once to log in)',
+  gemini: 'npm i -g @google/gemini-cli           (then run `gemini` once to log in)',
+  codex:  'npm i -g @openai/codex                (then run `codex` once to log in)',
+};
+function findOnPath(name) {
+  const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
+  for (const d of (process.env.PATH || '').split(delimiter)) {
+    if (!d) continue;
+    for (const e of exts) if (existsSync(join(d, name + e))) return join(d, name + e);
+  }
+  return null;
+}
+
 async function startHost(mode, args) {
   const cfg = resolveConfig(args, process.env);
   // A malformed --budget must NEVER silently coerce to "unlimited" (parseInt('abc')→0).
@@ -117,6 +136,14 @@ async function startHost(mode, args) {
   // unguarded agent. Unset is the documented default (unlimited).
   if (cfg.budget != null && !/^[1-9]\d*$/.test(String(cfg.budget).trim())) {
     die(`--budget must be a positive integer (got "${cfg.budget}"). Omit it for no cap; a malformed value won't be treated as unlimited.`);
+  }
+  // Fail fast if the chosen agent's CLI isn't installed — bypass with --no-agent-check
+  // (or CONCORD_NO_AGENT_CHECK=1) for non-PATH installs / wrappers.
+  if (!args.includes('--no-agent-check') && process.env.CONCORD_NO_AGENT_CHECK !== '1') {
+    if (!findOnPath(cfg.agent)) {
+      const hint = AGENT_INSTALL_HINT[cfg.agent] || `install the ${cfg.agent} CLI and run it once to log in`;
+      die(`\`${cfg.agent}\` CLI not found on PATH.\n\nconcord-agent drives your local ${cfg.agent} CLI (it uses your existing login). Install it first:\n  ${hint}\n\nThen re-run this command. If you already have it installed in a non-standard location, pass --no-agent-check to skip this check.`);
+    }
   }
   const fg = args.includes('--fg');
   const cwd = cfg.cwd || process.cwd();
