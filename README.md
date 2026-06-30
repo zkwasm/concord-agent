@@ -33,7 +33,9 @@ concord join <agent> [room] [--cwd .] [--budget N] [--fg]
     No --room → opens a browser to create/pick one, then starts.
 concord host <agent> [room] [--cwd .] [--budget N] [--fg]
     join + connect your own IM bot (personal mode). Progress ON.
-concord login lark|feishu --app-id <id> [--app-secret <s>]   Store your own bot creds (0600)
+concord login lark|feishu --qr                  Scan a QR to create + log in the bot (recommended; no developer console, no version publish)
+concord login lark|feishu --app-id <id> [--app-secret <s>]   ...or store bot creds manually (0600)
+concord im [stop|status|logs]                   Run the IM owner — owns your bot + relays bound chats (one per bot)
 concord logout [lark|feishu]
 concord list | status <id> | logs <id> [-f]
 concord stop <id> | restart <id> | rm <id> | prune
