@@ -60,7 +60,9 @@ Usage:
   concord budget <id> [--reset]      Show token usage / clear a budget pause
   concord resume <id>                Clear a timeout/budget pause (accept tasks again)
   concord rm <id> [--yes] | prune    Stop + reclaim (if running) then remove an entry / drop dead ones
-  concord shutdown                   Stop EVERYTHING — IM owner + all agents + clear all bindings
+  concord shutdown                   Stop EVERYTHING (owner + agents) but KEEP configs + bindings (reversible)
+  concord up                         Bring the whole fleet back after shutdown (bots need no re-binding)
+  concord reset [--yes]              Hard wipe: stop all + delete configs + clear bindings (bots must re-bind; keeps login)
   concord version                    Show the concord-agent version (also -v / --version)
   concord help
 
@@ -88,6 +90,13 @@ const truncWidth = (s, max) => { s = String(s); if (dispWidth(s) <= max) return 
 // What `list`/`status` show for a room: the cached human name if we have one, else the
 // short id, truncated to keep the table column aligned. Purely local — never a network read.
 const roomLabel = (h) => truncWidth(h.roomName || shortRoom(h.room), 20);
+// How the IM side of a binding reads in list/status: the resolved group name, else 私聊(shortid)
+// for a p2p chat (Lark p2p has no title) — never the bare opaque oc_ id on its own.
+const chatLabel = (bd, w = 14) => (bd.chatName ? truncWidth(bd.chatName, w) : `私聊(${truncWidth(bd.chatId, Math.max(6, w - 4))})`);
+// Rooms served by a LIVE local agent (fresh pid check). The authoritative, always-current
+// agent-presence for CLI displays — the owner's health snapshot only refreshes each reconcile
+// (~45s), so a just-`stop`ped agent would still read "present" there. Same box as the agents.
+const liveAgentRoomsLocal = () => new Set(reg.list().filter((h) => h.mode !== 'im' && !h.stopped && h.alive && h.room).map((h) => h.room));
 const ago = (t) => { const s = Math.max(0, Math.round((Date.now() - t) / 1000)); return s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : `${Math.round(s / 3600)}h`; };
 
 // Build the supervisor argv from saved fields (used by start + restart).
@@ -178,6 +187,27 @@ async function startHost(mode, args) {
   let room = cfg.roomId;
   if (!room) { room = await obtainRoomId(cfg.publicUrl || cfg.url); console.log('  → room connected.'); }
 
+  // --bind only: a bot chat can be served by ONE agent, and a second agent can't take over
+  // the same bot — so if a live LOCAL agent already serves this room, binding another chat to
+  // it should REUSE that agent (just add the binding), not spawn a duplicate. Default = reuse
+  // (Enter). --new-agent forces a fresh one; --reuse skips the prompt. (Plain join/host into a
+  // shared room stays multi-agent — no prompt.)
+  if (cfg.bind) {
+    const servedBy = reg.list().find((h) => h.mode !== 'im' && h.room === room && h.alive);
+    if (servedBy) {
+      const startNew = args.includes('--new-agent') ? true : args.includes('--reuse') ? false
+        : await confirm(`room ${shortRoom(room)} 已有活 agent ${servedBy.id}。新起一个独立 agent(不复用)?`);
+      if (!startNew) {
+        const platform = resolveImPlatform(cfg, 'host');
+        if (!platform) die('--bind needs a logged-in IM platform — `concord login lark --qr`.');
+        const res = openBindings().bind(platform, cfg.bind, { roomId: room, agent: servedBy.agent, cwd: servedBy.cwd }, { force: cfg.force });
+        if (!res.ok) die(`chat ${cfg.bind} is already bound to room ${shortRoom(res.existing.roomId)} — add --force to rebind`);
+        console.log(`✓ 复用 ${servedBy.id}(room ${shortRoom(room)})· 绑定 ${platform} chat ${cfg.bind} → 同一房间。owner 会把消息转发给它。`);
+        return;
+      }
+    }
+  }
+
   // --bind: record a chat→room binding so the `concord im` owner relays this chat here.
   // Bound agents run progress ON (the owner relays the progress + reply from the room) and
   // do NOT own the bot (im=null) — the owner owns the single WSClient.
@@ -211,9 +241,13 @@ async function startHost(mode, args) {
 function listHosts() {
   const hosts = reg.list();
   if (!hosts.length) { console.log('(no hosted agents — `concord host <agent>` or `concord join <agent>`)'); return; }
-  // One formatter for header AND rows so the (now wider) ROOM column stays aligned.
-  const row = (c) => `${padCol(c[0], 18)} ${padCol(c[1], 8)} ${padCol(c[2], 5)} ${padCol(c[3], 20)} ${padCol(c[4], 9)} ${padCol(c[5], 7)} ${padCol(c[6], 6)} ${c[7]}`;
-  console.log(row(['ID', 'AGENT', 'MODE', 'ROOM', 'STATUS', 'PID', 'UP', 'TOK']));
+  // One formatter for header AND rows so the (now wider) ROOM column stays aligned. The IM
+  // column (last) answers "which chat/bot is this agent hooked to" in one glance (Tom's ask).
+  const row = (c) => `${padCol(c[0], 18)} ${padCol(c[1], 8)} ${padCol(c[2], 5)} ${padCol(c[3], 20)} ${padCol(c[4], 9)} ${padCol(c[5], 7)} ${padCol(c[6], 6)} ${padCol(c[7], 6)} ${c[8]}`;
+  console.log(row(['ID', 'AGENT', 'MODE', 'ROOM', 'STATUS', 'PID', 'UP', 'TOK', 'IM']));
+  // Reverse index room → binding once, so each row shows its bound chat without re-scanning.
+  const bindByRoom = {};
+  for (const b of Object.values(openBindings().list())) bindByRoom[b.roomId] = b;
   for (const h of hosts) {
     const rt = readRuntime(h.id);
     // STATUS now tells you what the agent is DOING, not just whether the pid is alive:
@@ -221,7 +255,9 @@ function listHosts() {
     const status = h.stopped ? 'stopped' : !h.alive ? 'crashed' : rt.paused ? 'paused' : rt.activity?.state === 'working' ? 'working' : 'idle';
     const u = readUsage(h.id, h.room);
     const tok = u ? String(u.fresh ?? 0) : '-';   // fresh tokens this window — a burner stands out at a glance
-    console.log(row([truncWidth(h.label || h.id, 18), h.agent || '', h.mode || '', roomLabel(h), status, String(h.pid || '-'), h.started ? ago(h.started) : '-', tok]));
+    const bd = bindByRoom[h.room];
+    const im = bd ? `${bd.platform}·${chatLabel(bd)}` : '-';
+    console.log(row([truncWidth(h.label || h.id, 18), h.agent || '', h.mode || '', roomLabel(h), status, String(h.pid || '-'), h.started ? ago(h.started) : '-', tok, im]));
   }
 }
 
@@ -288,12 +324,13 @@ function listBindings() {
   const all = Object.values(openBindings().list());
   if (!all.length) { console.log('(no IM bindings — `concord host <agent> --bind <chat-id>`, or DM your bot after `concord login … --qr`)'); return; }
   const live = reg.list();
-  const liveRooms = new Set(live.filter((h) => h.alive).map((h) => h.room));
+  const liveRooms = liveAgentRoomsLocal();
   const nameByRoom = new Map(live.filter((h) => h.roomName).map((h) => [h.room, h.roomName]));
-  // Prefer the owner's end-to-end health verdict (connection→room→agent) over the local
-  // "is there a live host" heuristic; fall back when no snapshot (owner down / pre-reconcile).
+  // Prefer the owner's end-to-end health verdict (connection→room), but override agent-presence
+  // with the LIVE local check so a just-`stop`ped agent reads "no agent" now, not a snapshot tick
+  // later; fall back to the local heuristic entirely when there's no snapshot (owner down).
   const verdictByChat = new Map();
-  for (const p of IM_PLATFORMS) for (const sb of readHealth(p)?.bindings || []) verdictByChat.set(`${p}:${sb.chatId}`, bindingVerdict(sb));
+  for (const p of IM_PLATFORMS) for (const sb of readHealth(p)?.bindings || []) verdictByChat.set(`${p}:${sb.chatId}`, bindingVerdict({ ...sb, agentState: liveRooms.has(sb.roomId) ? 'present' : 'absent' }));
   const row = (c) => `${padCol(c[0], 8)} ${padCol(c[1], 20)} ${padCol(c[2], 7)} ${padCol(c[3], 20)} ${padCol(c[4], 8)} ${c[5]}`;
   console.log(row(['PLATFORM', 'CHAT', 'TYPE', 'ROOM', 'AGENT', 'HEALTH']));
   for (const b of all) {
@@ -460,14 +497,53 @@ async function prune() {
   console.log('✓ ' + parts.join(' · '));
 }
 
-// One-shot teardown: stop the IM owner + every agent, then clear all IM bindings.
-// "I'm done" — leaves zero processes and zero bindings.
+// SOFT teardown: stop the IM owner + every agent, but KEEP each registry entry (marked
+// stopped) and ALL IM bindings. "I'm done for now" — fully reversible: `concord up` revives
+// the exact same fleet and the bots reconnect with no re-binding. (The hard wipe is `reset`.)
 async function shutdownAll() {
   const hosts = reg.list();
+  if (!hosts.length) { console.log('(nothing was running)'); return; }
+  for (const h of hosts) { await stopHostCmd(h.id, { silent: true }); console.log(`✓ stopped ${h.id}`); }   // stopHostCmd keeps the entry (pid:null, stopped:true)
+  const n = Object.keys(openBindings().list()).length;
+  console.log(`✓ stopped ${hosts.length} process(es); kept ${n} IM binding(s) + all configs.`);
+  console.log('  bring it all back:  concord up');
+}
+
+// Revive the fleet after `shutdown`: restart every stopped agent with its saved config and
+// re-start the IM owner (creds-aware). Bindings were kept, so bots need no re-binding.
+// Idempotent — already-running hosts are left alone.
+async function upAll() {
+  const hosts = reg.list();
+  if (!hosts.length) { console.log('(nothing to bring up — no saved hosts. start one:  concord host <agent>)'); return; }
+  let revived = 0, already = 0;
+  for (const h of hosts.filter((x) => x.mode !== 'im')) {
+    if (h.alive) { already++; continue; }
+    const pid = spawnDaemon(h.id, { ...h, pid: undefined, stopped: false }, { fg: false });
+    reg.update(h.id, { stopped: false });
+    console.log(`✓ up ${h.id} — pid ${pid}`);
+    revived++;
+  }
+  // Owners: revive via the creds-aware path (re-pins to the current app), but ONLY for
+  // logged-in platforms — never resurrect an owner for creds the user has since removed.
+  for (const platform of IM_PLATFORMS.filter((p) => getCreds(p))) {
+    try { const { pid, started } = await startImOwnerIfNeeded(platform); if (started) { console.log(`✓ up IM owner (${platform}) — pid ${pid}`); revived++; } else already++; }
+    catch (e) { console.log(`⚠️  IM owner (${platform}) 启动失败:${e?.message || e}`); }
+  }
+  console.log(`✓ up: ${revived} revived, ${already} already running`);
+}
+
+// HARD teardown: stop everything, drop every registry entry AND every IM binding — a clean
+// slate. Bots must be re-bound (/concord-bind) afterwards. Does NOT touch login creds (that's
+// `concord logout`). Destructive → confirm unless --yes.
+async function resetAll({ yes } = {}) {
+  const hosts = reg.list();
+  const nB = Object.keys(openBindings().list()).length;
+  if (!hosts.length && !nB) { console.log('(already a clean slate — nothing to reset)'); return; }
+  if (!yes && !(await confirm(`Reset 会停止 ${hosts.length} 个 host、删除它们的配置,并清掉 ${nB} 个 IM 绑定(bot 需重新 /concord-bind)。继续?`))) { console.log('(已取消)'); return; }
   for (const h of hosts) { await stopHostCmd(h.id, { silent: true }); reg.unregister(h.id, { removeState: true }); console.log(`✓ stopped + removed ${h.id}`); }
-  const b = openBindings(); const n = Object.keys(b.list()).length; b.clear();
-  console.log(`✓ cleared ${n} IM binding(s)`);
-  console.log(hosts.length ? '✓ all concord services stopped — clean slate.' : '(nothing was running)');
+  openBindings().clear();
+  console.log(`✓ cleared ${nB} IM binding(s)`);
+  console.log('✓ reset —— 干净 slate。(登录凭据保留;在聊天里发 /concord-bind 重新绑定 bot。)');
 }
 
 // Clear a budget pause on a running host (SIGUSR1 — the daemon resets its window).
@@ -656,11 +732,15 @@ async function imStatus() {
     if (!alive) { console.log(`  ✗ owner 没在运行 —— 启动:concord login ${platform} --qr   (或 concord im)`); continue; }
     const snap = readHealth(platform);
     if (!snap) { console.log(`  owner 在跑 (pid ${h.pid}),但还没写出健康快照 —— 等一个对账周期(~45s)再看。`); continue; }
+    // Refresh agent-presence from the LIVE registry so a just-`stop`ped agent shows as absent
+    // immediately, not after the owner's next reconcile tick (the snapshot lags ~45s).
+    const liveRooms = liveAgentRoomsLocal();
+    for (const b of snap.bindings || []) b.agentState = liveRooms.has(b.roomId) ? 'present' : 'absent';
     console.log(`  ${overallHeadline(snap).summary}`);
     console.log(`  app ${snap.appId || '-'} · 长连接 ${snap.eventPlane?.state || '?'}/${snap.eventPlane?.status || '?'} · 对账 ${snap.reconciledAt ? ago(snap.reconciledAt) : '?'}前`);
     if (!snap.bindings?.length) { console.log('  (还没有绑定 —— 在聊天里发 /concord-bind)'); continue; }
     for (const b of snap.bindings) {
-      console.log(`  · ${b.chatName || b.chatId} → ${b.roomName || shortRoom(b.roomId)}  [${bindingVerdict(b)}]`);
+      console.log(`  · ${chatLabel(b, 24)} → ${b.roomName || shortRoom(b.roomId)}  [${bindingVerdict(b)}]`);
       const na = bindingNextAction(b);
       if (na && na.cmd) console.log(`      ${na.summary}  →  ${na.cmd}`);
     }
@@ -726,7 +806,9 @@ switch (cmd) {
   case 'restart': positional[0] ? await restartHost(positional[0], { yes }) : die('usage: concord restart <id> [--yes]'); break;
   case 'rm': positional[0] ? await rmHost(positional[0], { yes }) : die('usage: concord rm <id> [--yes]'); break;
   case 'prune': await prune(); break;
+  case 'up': await upAll(); break;
   case 'shutdown': await shutdownAll(); break;
+  case 'reset': await resetAll({ yes }); break;
   case 'resume': rest[0] ? resumeHost(rest[0]) : die('usage: concord resume <id>'); break;
   case 'budget': rest[0] ? budgetCmd(rest[0], rest.slice(1)) : die('usage: concord budget <id> [--reset]'); break;
   case 'version': case '--version': case '-v': console.log(`concord-agent ${VERSION}`); break;

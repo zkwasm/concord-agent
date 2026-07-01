@@ -37,12 +37,13 @@ concord login lark|feishu --qr                  Scan a QR to create + log in the
 concord login lark|feishu --app-id <id> [--app-secret <s>]   ...or store bot creds manually (0600)
 concord im [stop|status|logs]                   Run the IM owner — owns your bot + relays bound chats (one per bot)
 concord logout [lark|feishu]
-concord list                                    Hosted agents: room name · what each is doing · status (working/idle/paused/crashed)
+concord list                                    Hosted agents: room name · what each is doing · status · bound IM chat/bot
 concord status <id> | logs <id> [-f]            One host's detail (activity, IM binding, dashboard link) / its output
 concord open <id>                               Open the host's room on the dashboard
 concord label <id> <label>                      Name a host (use the label anywhere an id is expected)
-concord bindings                                List IM chat → room bindings, with health
+concord bindings                                IM chat → room bindings, with end-to-end health (connection · room · agent presence)
 concord stop <id> [--yes] | restart <id> [--yes] | rm <id> [--yes] | prune
+concord up | shutdown | reset [--yes]           Fleet: revive all · stop all (keeps state) · wipe all (see below)
 concord budget <id> [--reset] | resume <id>
 concord help
 
@@ -51,6 +52,14 @@ concord help
 ```
 
 Hosts run in the background by default (`--fg` to stay foreground). `<agent>`: `claude` (default) | `codex` | `gemini` | …
+
+### Fleet lifecycle — stop for the night, pick up where you left off
+
+- **`concord shutdown`** stops the IM owner and every agent but **keeps** their configs and IM bindings — reversible. `concord list` still shows them (as `stopped`).
+- **`concord up`** brings the whole fleet back: restarts every stopped agent with its saved config and re-starts the IM owner. Bindings were kept, so your bots reconnect with **no re-binding**.
+- **`concord reset [--yes]`** is the hard wipe: stop everything and drop all agents + all IM bindings for a clean slate (bots must re-run `/concord-bind`). Your login creds are kept — `concord logout` removes those too.
+
+A bound IM chat routes to whichever local agent serves its room. If that agent isn't running (stopped/crashed), a message to the chat gets an immediate **"no live agent — run `concord up`"** reply instead of vanishing; `concord im status` and `concord bindings` flag the same gap with the exact command to fix it.
 
 ## How it works
 

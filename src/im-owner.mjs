@@ -52,7 +52,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   const rooms = new Map();        // roomId → { sessionId, chatId, polling, roomStatus, consec401, lastRelayAt, lastAgentState }
   const blockedRooms = new Set(); // roomId whose relay name is taken by a ghost (dual-409) — surfaced as 'blocked'
   // reconcile coalescing + health snapshot
-  let reconciling = false, pendingTrigger = null, prevSnapshot = null, tickN = 0;
+  let reconciling = false, pendingTrigger = null, prevSnapshot = null;
   const HEALTH_PATH = join(home, 'hosts', `im-${platform}`, 'health.json');
 
   // ---- IM side: send to a chat (interactive card, plain-text fallback) ----
@@ -108,6 +108,17 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     let name = '';
     try { const r = await fetchImpl(`${CONCORD_URL}/agent/rooms/${roomId}/info`); if (r.ok) name = (await r.json())?.name || ''; } catch { /* best effort */ }
     roomNameCache.set(roomId, name);
+    return name;
+  }
+  // The Lark CHAT's human name (group title), so `concord list`/`bindings`/`im status` can show
+  // "lark·设计群" instead of a meaningless "lark·oc_1076…". '' for a p2p chat (no title) or if
+  // the im:chat:readonly scope is missing. In-process cache: one chat.get per chat, ever.
+  const chatNameCache = new Map();
+  async function resolveChatName(chatId) {
+    if (chatNameCache.has(chatId)) return chatNameCache.get(chatId);
+    let name = '';
+    try { const r = await client.im.v1.chat.get({ path: { chat_id: chatId } }); name = r?.data?.name || ''; } catch { /* p2p / missing scope */ }
+    chatNameCache.set(chatId, name);
     return name;
   }
 
@@ -211,7 +222,16 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
   async function routeMessage(chatId, text, sender) {
     const b = store.get(platform, chatId);
     if (!b) { await send(chatId, '本聊天还没绑 agent —— 发 **/concord-bind** 设置。'); return { action: 'unbound' }; }
-    if (sender) await send(chatId, '收到 👌');
+    // No live LOCAL agent serving this room → the message would vanish. Tell the user NOW
+    // (instead of a false "收到 👌") so they don't sit waiting on a dead room. `host --bind`
+    // agents are always local, so the registry is authoritative here.
+    if (!liveAgentRooms().has(b.roomId)) {
+      await send(chatId, '⚠️ 这个房间当前没有活着的 agent,消息还没人处理。请在机器上 `concord up` 拉起(或 `concord host …` 新建)。');
+      return { action: 'no-agent', roomId: b.roomId };
+    }
+    // Single, meaningful ack — names the agent, no double "收到" (the bound agent no longer
+    // self-acks; the owner is the one user-facing acker in bind mode).
+    if (sender) { const a = b.agent || 'agent'; await send(chatId, `🤖 ${a[0].toUpperCase()}${a.slice(1)} 正在处理…`); }
     try {
       const rc = await ensureRoom(b.roomId, chatId);
       await roomPost(b.roomId, rc.sessionId, rc.relaySender, sender ? `${sender}: ${text}` : text);
@@ -270,26 +290,21 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
 
   // ---- reconcile: align desired (bindings) vs actual (relay/conn/room/agent), self-correct
   //      or surface, write the health snapshot the CLI reads. Coalescing + non-fatal. ----
-  async function fetchT(url, ms = 4000) {
-    const ac = new AbortController(); const t = setTimeout(() => ac.abort(), ms);
-    try { return await fetchImpl(url, { signal: ac.signal }); } finally { clearTimeout(t); }
-  }
-  // Is there a live non-relay agent in the room? Uses the room-token GET /agent/rooms/:id/agents
-  // (added for this). 404 → 'unknown' (room gone OR endpoint not deployed yet) — never falsely 'absent'.
-  async function agentPresence(roomId, relaySender) {
+  // Same-machine, authoritative agent presence: which rooms have a LIVE local agent process.
+  // The owner and every `host --bind` agent share this ~/.concord, and a bound room's agent
+  // was started on THIS box, so the registry (pid + kill-0) is ground truth. This REPLACES an
+  // earlier server call to /agent/rooms/:id/agents, whose "ever-joined in 30d" signal never
+  // said "absent" — so a stopped agent still looked present and messages vanished (石沉大海).
+  function liveAgentRooms() {
+    const live = new Set();
     try {
-      const r = await fetchT(`${CONCORD_URL}/agent/rooms/${roomId}/agents`);
-      if (!r.ok) return 'unknown';
-      const agents = (await r.json())?.agents || [];
-      const others = agents.filter((n) => n !== RELAY_SENDER && n !== relaySender);
-      return others.length > 0 ? 'present' : 'absent';
-    } catch { return 'unknown'; }
-  }
-  // Round-robin deep checks on large fleets so the per-room API budget (60/min/room) is safe.
-  function shouldDeepCheck(roomId, fleetSize) {
-    if (fleetSize <= 4) return true;
-    let h = 0; for (const c of String(roomId)) h = (h + c.charCodeAt(0)) % 3;
-    return h === tickN % 3;
+      const all = JSON.parse(readFileSync(join(home, 'hosts.json'), 'utf8'));
+      for (const h of Object.values(all)) {
+        if (h.mode === 'im' || h.stopped || !h.room || !h.pid) continue;   // the owner isn't an agent; skip stopped/unrooted
+        try { process.kill(h.pid, 0); live.add(h.room); } catch (e) { if (e.code === 'EPERM') live.add(h.room); }
+      }
+    } catch { /* no/unreadable registry → nothing is live */ }
+    return live;
   }
   function writeSnapshot(snap) {
     try { mkdirSync(dirname(HEALTH_PATH), { recursive: true }); const tmp = HEALTH_PATH + '.tmp'; writeFileSync(tmp, JSON.stringify(snap, null, 2)); renameSync(tmp, HEALTH_PATH); }
@@ -315,6 +330,7 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     try { const s = ws.getConnectionStatus?.(); if (s?.state) connState = s.state; } catch { /* SDK may not expose at all states */ }
     const now = Date.now();
     const mine = Object.values(store.list()).filter((b) => b.platform === platform);   // read bindings ONCE
+    const liveRooms = liveAgentRooms();                                                // same-machine ground truth, read ONCE per tick
     const credsAppId = (() => { try { return loadCreds(home)[platform]?.appId || null; } catch { return null; } })();
     const credsDrift = bakedAppId && credsAppId && credsAppId !== bakedAppId ? { fileAppId: credsAppId, bakedAppId } : false;
     const bindingsSnap = [];
@@ -322,9 +338,12 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
       const rc = rooms.get(b.roomId);
       const relay = blockedRooms.has(b.roomId) ? 'blocked' : rc?.polling ? 'up' : 'down';
       const room = rc?.roomStatus || 'unknown';
-      let agentState = rc?.lastAgentState || 'unknown';
-      if (shouldDeepCheck(b.roomId, mine.length)) { agentState = await agentPresence(b.roomId, rc?.relaySender); if (rc) rc.lastAgentState = agentState; }
-      bindingsSnap.push({ chatId: b.chatId, chatName: b.chatName || null, roomId: b.roomId, agent: b.agent || null, relay, room, agentState, lastRelayAt: rc?.lastRelayAt || 0 });
+      const agentState = liveRooms.has(b.roomId) ? 'present' : 'absent';
+      if (rc) rc.lastAgentState = agentState;
+      // Fill in a human chat name once (persisted to the binding), so list/status stop showing raw oc_ ids.
+      let chatName = b.chatName || null;
+      if (!chatName) { const nm = await resolveChatName(b.chatId); if (nm) { chatName = nm; store.setChatName(platform, b.chatId, nm); } }
+      bindingsSnap.push({ chatId: b.chatId, chatName, roomId: b.roomId, agent: b.agent || null, relay, room, agentState, lastRelayAt: rc?.lastRelayAt || 0 });
     }
     const snap = {
       platform, appId: bakedAppId, ownerPid: process.pid, state: 'running', reconciledAt: now,
@@ -338,7 +357,6 @@ export function createOwner({ platform = 'lark', appId, appSecret, domain, url, 
     } catch (e) { log('[owner] breadcrumb error: ' + e.message); }
     writeSnapshot(snap);
     prevSnapshot = snap;
-    tickN++;
   }
   async function reconcile(trigger) {
     if (reconciling) { pendingTrigger = (TRIG_RANK[trigger] ?? 0) > (TRIG_RANK[pendingTrigger] ?? -1) ? trigger : pendingTrigger; return; }

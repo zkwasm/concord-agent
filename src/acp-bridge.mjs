@@ -89,16 +89,21 @@ const post = (path, body) => fetch(room + path, { method: 'POST', headers: { 'co
 
 async function joinRoom() {
   // Resume the persisted session first: stable identity across restarts + the
-  // processed-id dedup below ensures old turns aren't re-run.
+  // processed-id dedup below ensures old turns aren't re-run. Resume with the SAME sender
+  // the session was created under (persisted) — NOT a blind AGENT_NAME. A prior restart may
+  // have joined under a 409-fallback name ("claude-1234"); resuming that session while
+  // claiming "claude" reads fine (GET is session-only) but every POST 403s (sender≠owner),
+  // so replies silently vanish. Reusing the stored sender keeps sender==owner.
   const existing = store.getSessionId(CONCORD_ROOM_ID);
+  const storedSender = store.getSender(CONCORD_ROOM_ID) || AGENT_NAME;
   if (existing) {
-    const res = await post('/join', { sender: AGENT_NAME, agentSessionId: existing });
-    if (res.ok) { senderName = AGENT_NAME; sessionId = (await res.json()).agentSessionId; store.setSessionId(CONCORD_ROOM_ID, sessionId); console.log(`✓ Concord: resumed room as "${AGENT_NAME}"`); return; }
+    const res = await post('/join', { sender: storedSender, agentSessionId: existing });
+    if (res.ok) { senderName = storedSender; sessionId = (await res.json()).agentSessionId; store.setSessionId(CONCORD_ROOM_ID, sessionId); store.setSender(CONCORD_ROOM_ID, senderName); console.log(`✓ Concord: resumed room as "${senderName}"`); return; }
     store.setSessionId(CONCORD_ROOM_ID, null); // stale resume token → fresh join
   }
   for (const name of [AGENT_NAME, `${AGENT_NAME}-${process.pid % 10000}`]) {
     const res = await post('/join', { sender: name });
-    if (res.ok) { senderName = name; sessionId = (await res.json()).agentSessionId; store.setSessionId(CONCORD_ROOM_ID, sessionId); console.log(`✓ Concord: joined room as "${name}"`); return; }
+    if (res.ok) { senderName = name; sessionId = (await res.json()).agentSessionId; store.setSessionId(CONCORD_ROOM_ID, sessionId); store.setSender(CONCORD_ROOM_ID, name); console.log(`✓ Concord: joined room as "${name}"`); return; }
     if (res.status !== 409) die(`join failed: ${res.status} ${await res.text()}`);
     console.warn(`  name "${name}" taken, retrying…`);
   }
@@ -123,9 +128,18 @@ function clip(text) {
 }
 async function sendToRoom(text) {
   const content = text.length > ROOM_MSG_LIMIT ? clip(text) : text;
-  const body = { sender: senderName, agentSessionId: sessionId, content };
-  const res = await post('/messages', body);
-  if (res.status === 413) return post('/messages', { ...body, content: clip(text) });   // backstop if even the clipped body is rejected
+  let res = await post('/messages', { sender: senderName, agentSessionId: sessionId, content });
+  if (res.status === 413) return post('/messages', { sender: senderName, agentSessionId: sessionId, content: clip(text) });   // backstop if even the clipped body is rejected
+  // 401 (session expired) or 403 (sender≠session owner — e.g. a mismatched resume, or a stale
+  // session inherited from an upgrade): drop the bad session, re-join FRESH (clearing the stored
+  // session so it's not a resume), and retry ONCE. Without this every reply silently 403s and the
+  // user sees nothing — exactly the "agent processed the turn but never replied" bug.
+  if (res.status === 401 || res.status === 403) {
+    console.warn(`room post ${res.status} → rejoin + retry`);
+    store.setSessionId(CONCORD_ROOM_ID, null);   // force a fresh join, not a resume of the bad session
+    try { await joinRoom(); res = await post('/messages', { sender: senderName, agentSessionId: sessionId, content }); }
+    catch (e) { console.warn('rejoin failed: ' + e.message); }
+  }
   if (!res.ok) console.warn(`room post ${res.status} — message may not have landed`);
   return res;
 }
@@ -335,8 +349,12 @@ async function handleInbound({ text, sender, imChat = null }) {
   }
   if (paused) { if (im && imChat) im.send(imChat, '⏸️ 已暂停(多次超时);让 owner 跑 `concord resume`/`restart` 后再发。').catch(() => {}); return; }
   if (budgetBlocked(Date.now())) { await budgetNote(imChat); return; }   // over budget → refuse cleanly
-  if (PROGRESS && !store.wasIntroduced(CONCORD_ROOM_ID)) { await out(introText(), imChat); store.setIntroduced(CONCORD_ROOM_ID); }
-  if (PROGRESS) await out(nextAck(), imChat);                  // instant "收到" before the agent works
+  // Self-intro + ack ONLY when this agent owns its own IM bridge (`--im`). In `--bind` mode the
+  // `concord im` owner is the user-facing acker ("🤖 Claude 正在处理…"), so a second ack here
+  // would double up in the chat (the owner relays our room posts back). Progress cards + the
+  // final reply still flow either way.
+  if (PROGRESS && IM_PLATFORM && !store.wasIntroduced(CONCORD_ROOM_ID)) { await out(introText(), imChat); store.setIntroduced(CONCORD_ROOM_ID); }
+  if (PROGRESS && IM_PLATFORM) await out(nextAck(), imChat);   // instant "收到" before the agent works (self-owned IM only)
   console.log(`→ agent | ${sender}: ${content}`);
   pending.push({ text: `[${sender}] ${content}`, imChat });
   drain();

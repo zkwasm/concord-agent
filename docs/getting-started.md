@@ -164,7 +164,9 @@ concord stop <id>          # stop, keep its state
 concord rm <id>            # stop + reclaim + drop that chat's binding
 concord budget <id>        # token usage   (--reset clears a budget pause)
 concord resume <id>        # clear a budget pause, accept tasks again
-concord shutdown           # stop EVERYTHING — owner + all agents + clear all bindings
+concord shutdown           # stop the owner + all agents, but KEEP configs + bindings (reversible)
+concord up                 # bring the whole fleet back after shutdown (no re-binding needed)
+concord reset --yes        # hard wipe: stop all + drop all bindings/configs (bots must re-bind; keeps login)
 ```
 
 ---

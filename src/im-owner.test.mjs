@@ -3,7 +3,7 @@
 // verified against a real Lark app. Run: node --test src/im-owner.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openBindings } from './im-bindings.mjs';
@@ -44,7 +44,15 @@ function freshOwner({ userCount } = {}) {
   const captured = { posts: [] };
   const store = openBindings(root);
   const owner = createOwner({ platform: 'lark', url: 'http://test', log: () => {}, bindings: store, home: root, _clients: { client, ws: fakeWs, fetch: mockFetch(captured) } });
-  return { owner, client, store, captured, cleanup: () => { owner.shutdown(); rmSync(root, { recursive: true, force: true }); } };
+  // Register a live LOCAL agent for a room (pid = process.pid, guaranteed alive) so routeMessage's
+  // same-machine presence check sees it as served — mirrors a real `host --bind` registration.
+  const regPath = join(root, 'hosts.json');
+  const addLiveAgent = (roomId, id = 'claude-' + roomId.slice(0, 6)) => {
+    let all = {}; try { all = JSON.parse(readFileSync(regPath, 'utf8')); } catch { /* none yet */ }
+    all[id] = { id, mode: 'host', room: roomId, pid: process.pid };
+    writeFileSync(regPath, JSON.stringify(all));
+  };
+  return { owner, client, store, captured, addLiveAgent, cleanup: () => { owner.shutdown(); rmSync(root, { recursive: true, force: true }); } };
 }
 
 test('/concord-bind in an UNBOUND p2p chat → prompts the host command, no --budget', async () => {
@@ -76,19 +84,31 @@ test('/concord-bind in an ALREADY-bound chat → --force prompt', async () => {
 });
 
 test('unbound message → "send /concord-bind"; bound message → instant ack + POST to room', async () => {
-  const { owner, client, store, captured, cleanup } = freshOwner();
+  const { owner, client, store, captured, addLiveAgent, cleanup } = freshOwner();
   try {
     const u = await owner.onEvent(ev({ text: 'hello', chatType: 'p2p', chatId: 'oc_u' }));
     assert.equal(u.action, 'unbound');
     assert.match(client.sent[0].text, /\/concord-bind/);
 
     store.bind('lark', 'oc_b', { roomId: 'room-xyz99999' });
+    addLiveAgent('room-xyz99999');                                             // a live local agent serves the bound room
     client.sent.length = 0;
     const b = await owner.onEvent(ev({ text: 'do the thing', chatType: 'p2p', chatId: 'oc_b' }));
     assert.equal(b.action, 'routed');
-    assert.match(client.sent[0].text, /收到/);                                 // owner instant ack (decision 4)
+    assert.match(client.sent[0].text, /正在处理/);                             // owner instant ack, names the agent (single, no double "收到")
     assert.ok(captured.posts.some((p) => /do the thing/.test(p.content)));      // posted into the bound room
     assert.ok(captured.posts.every((p) => p.sender === 'IM'));                  // as the relay identity (loop guard)
+  } finally { cleanup(); }
+});
+
+test('bound chat with NO live local agent → warns in-chat, does NOT post (no silent void)', async () => {
+  const { owner, client, store, captured, cleanup } = freshOwner();
+  try {
+    store.bind('lark', 'oc_dead', { roomId: 'room-dead0000' });   // bound, but no live agent registered
+    const r = await owner.onEvent(ev({ text: 'do the thing', chatType: 'p2p', chatId: 'oc_dead' }));
+    assert.equal(r.action, 'no-agent');
+    assert.match(client.sent.at(-1).text, /没有活着的 agent/);      // told the user immediately, not a false "收到"
+    assert.equal(captured.posts.length, 0);                       // nothing relayed into the dead room
   } finally { cleanup(); }
 });
 
@@ -107,12 +127,13 @@ test('group message without @ is ignored; /concord-unbind removes a binding', as
 });
 
 test('solo group (user_count=1): un-@ message is routed, like p2p', async () => {
-  const { owner, client, store, captured, cleanup } = freshOwner({ userCount: 1 });
+  const { owner, client, store, captured, addLiveAgent, cleanup } = freshOwner({ userCount: 1 });
   try {
     store.bind('lark', 'oc_solo', { roomId: 'room-solo1234' });
+    addLiveAgent('room-solo1234');
     const r = await owner.onEvent(ev({ text: 'run the build', chatType: 'group', mentions: [], chatId: 'oc_solo' }));
     assert.equal(r.action, 'routed');
-    assert.match(client.sent[0].text, /收到/);
+    assert.match(client.sent[0].text, /正在处理/);
     assert.ok(captured.posts.some((p) => /run the build/.test(p.content)));
   } finally { cleanup(); }
 });

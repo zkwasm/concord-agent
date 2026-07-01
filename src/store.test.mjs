@@ -1,14 +1,19 @@
 // Pure-logic tests for the bridge runtime store. Run: node --test bridges/common/store.test.mjs
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openStore } from './store.mjs';
 
+// Track every temp dir so they don't pile up in $TMPDIR across runs (was leaking one per test).
+const dirs = [];
 function freshPath() {
-  return join(mkdtempSync(join(tmpdir(), 'bridge-store-')), 'state.json');
+  const d = mkdtempSync(join(tmpdir(), 'bridge-store-'));
+  dirs.push(d);
+  return join(d, 'state.json');
 }
+after(() => { for (const d of dirs) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } } });
 
 test('session id survives reopen (resume across restarts)', () => {
   const path = freshPath();
@@ -18,6 +23,17 @@ test('session id survives reopen (resume across restarts)', () => {
   const s2 = openStore(path);
   assert.equal(s2.getSessionId('room1'), 'sess-123');
   assert.equal(s2.wasRelayedIn('room1', 'm1'), true);
+});
+
+test('sender name survives reopen (resume with the SAME identity → no 403 on post)', () => {
+  const path = freshPath();
+  const s1 = openStore(path);
+  assert.equal(s1.getSender('room1'), null);          // unknown until first join
+  s1.setSessionId('room1', 'sess-9');
+  s1.setSender('room1', 'claude-1234');               // joined under a 409-fallback name
+  const s2 = openStore(path);
+  assert.equal(s2.getSender('room1'), 'claude-1234'); // resume must reuse this, not blind AGENT_NAME
+  assert.equal(s2.getSessionId('room1'), 'sess-9');
 });
 
 test('adapter pgid survives reopen (CLI can reap an orphaned group)', () => {

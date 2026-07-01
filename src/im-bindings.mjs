@@ -37,6 +37,17 @@ export function openBindings(root = ROOT) {
       persist(all);
       return { ok: true, binding: all[k] };
     },
+    // Cache a resolved human chat name onto the binding (the owner fills this in from Lark;
+    // list/status/bindings then show "设计群" instead of a raw oc_ id). No-op if unchanged/empty.
+    setChatName(platform, chatId, name) {
+      if (!name) return false;
+      const all = load();
+      const k = keyOf(platform, chatId);
+      if (!all[k] || all[k].chatName === name) return false;
+      all[k] = { ...all[k], chatName: name };
+      persist(all);
+      return true;
+    },
     // Remove a chat's binding. Returns whether something was removed.
     unbind(platform, chatId) {
       const all = load();

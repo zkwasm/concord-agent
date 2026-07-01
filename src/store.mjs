@@ -54,6 +54,12 @@ export function openStore(filePath) {
     // --- per-room poll state (resume reads across restarts) ---
     getSessionId(roomId) { return roomState(roomId).sessionId; },
     setSessionId(roomId, sessionId) { roomState(roomId).sessionId = sessionId; persist(); },
+    // The sender name this session was joined as. MUST be resumed with the SAME name — the
+    // server binds a session to its creating sender and 403s a post whose sender differs
+    // (e.g. resuming a session created under a 409-fallback name "claude-1234" while claiming
+    // "claude"). Persisted so a restart resumes with the matching identity.
+    getSender(roomId) { return roomState(roomId).sender || null; },
+    setSender(roomId, sender) { roomState(roomId).sender = sender || null; persist(); },
 
     // --- idempotency / echo dedup ---
     markRelayedIn(roomId, msgId) { boundPush(roomState(roomId).relayedIn, msgId); persist(); },

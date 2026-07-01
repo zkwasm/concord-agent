@@ -39,6 +39,17 @@ test('bind / unbind: /concord-bind canonical + bare accepted, in p2p and group',
   assert.equal(classifyInbound({ text: 'concord-unbind', chatType: 'p2p' }).action, 'unbind');
 });
 
+test('group @bot with a MULTI-WORD bot name ("Concord · Arkreen") still detects the command', () => {
+  // cleanText has already turned the @_user_N placeholder into "@"+name; a name with spaces/·
+  // used to leave residue ("· Arkreen /concord-bind") after the generic @\S+ strip → matched as
+  // a plain message → "本聊天还没绑 agent" instead of the bind prompt. Strip by exact name now.
+  const mentions = [{ key: '@_user_1', name: 'Concord · Arkreen' }];
+  assert.equal(commandOf('@Concord · Arkreen /concord-bind', mentions), '/concord-bind');
+  assert.equal(classifyInbound({ text: '@Concord · Arkreen /concord-bind', chatType: 'group', mentions }).action, 'bind');
+  assert.equal(classifyInbound({ text: '@Concord · Arkreen /concord-unbind', chatType: 'group', mentions }).action, 'unbind');
+  assert.equal(classifyInbound({ text: '@Concord · Arkreen /agents', chatType: 'group', mentions }).action, 'agents');
+});
+
 test('usage query detected; group usage still needs the @', () => {
   assert.equal(classifyInbound({ text: '/usage', chatType: 'p2p' }).action, 'usage');
   assert.equal(classifyInbound({ text: '用量', chatType: 'p2p' }).action, 'usage');

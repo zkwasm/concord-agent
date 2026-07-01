@@ -1,12 +1,15 @@
 // Tests for the host registry. Run: node --test bridges/acp/hosts.test.mjs
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, existsSync } from 'node:fs';
+import { mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openRegistry, pidAlive, newId } from './hosts.mjs';
 
-const freshRoot = () => mkdtempSync(join(tmpdir(), 'concord-hosts-'));
+// Track every temp root so they don't pile up in $TMPDIR across runs (was leaking one per test).
+const roots = [];
+const freshRoot = () => { const d = mkdtempSync(join(tmpdir(), 'concord-hosts-')); roots.push(d); return d; };
+after(() => { for (const d of roots) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } } });
 
 test('register / get / isolated state dir + path', () => {
   const r = openRegistry(freshRoot());

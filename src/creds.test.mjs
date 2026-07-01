@@ -1,12 +1,15 @@
 // Tests for local IM bot credential storage. Run: node --test bridges/acp/creds.test.mjs
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, statSync } from 'node:fs';
+import { mkdtempSync, statSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveCreds, getCreds, removeCreds, loadCreds, credsPath } from './creds.mjs';
 
-const freshRoot = () => mkdtempSync(join(tmpdir(), 'concord-creds-'));
+// Track every temp root so they don't pile up in $TMPDIR across runs (was leaking one per test).
+const roots = [];
+const freshRoot = () => { const d = mkdtempSync(join(tmpdir(), 'concord-creds-')); roots.push(d); return d; };
+after(() => { for (const d of roots) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } } });
 
 test('save / get / remove per platform', () => {
   const root = freshRoot();
