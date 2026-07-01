@@ -2,6 +2,36 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.0 — 2026-07-02
+
+Behavior change to token accounting + new in-room commands. **Upgrade is drop-in — bindings,
+login creds and room sessions are all preserved (no re-bind / re-login).** The only step:
+`concord restart <id>` (or `concord shutdown` + `concord up`) any **currently-running** hosts so
+they run the new daemon — the new `concord budget --reset` signals over `SIGUSR2`, which an
+old still-running daemon would mishandle.
+
+### Changed
+- **Token accounting is now a lifetime cumulative meter.** Usage per task/room only ever grows
+  and is **never reset automatically** — not by time, a restart, `/compact`, or `/clear`. The one
+  and only way to zero it is an explicit **`concord budget <id> --reset`**. (Previously it reset on
+  a rolling 24h window.) This is so you can see exactly how many tokens a whole task consumed.
+- **`--budget N` is now a lifetime cap** (was per-window). No cap (the default) → pure metering,
+  never pauses. Over the cap, the agent pauses and resumes only via `--reset`.
+- **`concord resume` no longer touches the meter** — it only clears a *timeout* pause. Resetting
+  the counter is a separate, explicit `concord budget --reset` (now delivered via `SIGUSR2`).
+- **Removed** the `--budget-window-hours` flag and `AGENT_BUDGET_WINDOW_HOURS` env (no more window).
+
+### Added
+- **In-room commands** — type these in the room (or a bound IM chat) to manage the agent's session:
+  - `/compact` — compact (summarize) the context (a real turn; its token cost is counted).
+  - `/clear` — reset the agent to an empty context by recycling its session. Its **name, room
+    membership, IM binding and the cumulative token meter are all kept** — only the agent's memory
+    is wiped. (The adapter marks `/clear` unsupported, so this is a bridge-level session recycle.)
+  - `/context` — show how much of the context window is in use (read-only).
+  - `/help` — list the in-room commands. (Plus the existing `/usage` / `/stats` / `用量`.)
+  - Safe allowlist: capability/permission/model/identity commands (`/model`, `/permissions`,
+    `/add-dir`, `/login`, …) are deliberately **not** accepted from a room message.
+
 ## 0.6.4 — 2026-07-01
 
 Documentation & internal only — **no runtime code changes** (agent/CLI behavior identical to 0.6.3).

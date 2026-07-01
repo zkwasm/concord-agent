@@ -52,9 +52,8 @@ test('resolveConfig: --name and --public-url honored', () => {
 });
 
 test('resolveConfig: token budget is a CLI param (flag > env > unset)', () => {
-  const cfg = resolveConfig(['claude', '--room', 'r', '--budget', '50000', '--budget-window-hours', '12'], {});
+  const cfg = resolveConfig(['claude', '--room', 'r', '--budget', '50000'], {});
   assert.equal(cfg.budget, '50000');
-  assert.equal(cfg.budgetWindowHours, '12');
   // flag overrides env
   assert.equal(resolveConfig(['claude', '--budget', '9000'], { AGENT_TOKEN_BUDGET: '1' }).budget, '9000');
   // env fallback when no flag

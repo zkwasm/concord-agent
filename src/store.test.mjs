@@ -69,24 +69,24 @@ test('dedup lists are bounded (no unbounded growth)', () => {
   assert.equal(s.wasProcessedInbound('e0'), false);   // oldest evicted
 });
 
-test('usage accounting: accumulate, window start, reset, survive reopen', () => {
+test('usage accounting: lifetime cumulative, reset only on demand, survive reopen', () => {
   const path = freshPath();
   const s = openStore(path);
-  assert.deepEqual({ ...s.getUsage('r'), windowStart: s.getUsage('r').windowStart }, { fresh: 0, cached: 0, turns: 0, windowStart: null });
-  s.addUsage('r', 100, 2000, 5000);   // first add sets windowStart
-  s.addUsage('r', 50, 1000, 6000);
+  assert.deepEqual(s.getUsage('r'), { fresh: 0, cached: 0, turns: 0 });
+  s.addUsage('r', 100, 2000);
+  s.addUsage('r', 50, 1000);
   let u = s.getUsage('r');
   assert.equal(u.fresh, 150);
   assert.equal(u.cached, 3000);
   assert.equal(u.turns, 2);
-  assert.equal(u.windowStart, 5000);  // set once, not moved by later adds
-  // survives reopen
+  // survives reopen (never auto-reset — not by time, restart, /compact or /clear)
   const s2 = openStore(path);
   assert.equal(s2.getUsage('r').fresh, 150);
-  // reset zeroes counters + restamps the window
-  s2.resetUsage('r', 9000);
-  u = s2.getUsage('r');
-  assert.deepEqual([u.fresh, u.cached, u.turns, u.windowStart], [0, 0, 0, 9000]);
+  s2.addUsage('r', 25, 0);            // keeps accumulating after reopen
+  assert.equal(s2.getUsage('r').fresh, 175);
+  // explicit reset zeroes counters (the ONLY reset path: concord budget --reset)
+  s2.resetUsage('r');
+  assert.deepEqual(s2.getUsage('r'), { fresh: 0, cached: 0, turns: 0 });
 });
 
 test('getUsage returns a copy (caller cannot mutate internal state)', () => {

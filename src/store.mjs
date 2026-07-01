@@ -47,7 +47,7 @@ export function openStore(filePath) {
 
   function usageState(roomId) {
     const r = roomState(roomId);
-    return r.usage || (r.usage = { fresh: 0, cached: 0, turns: 0, windowStart: null });
+    return r.usage || (r.usage = { fresh: 0, cached: 0, turns: 0 });
   }
 
   return {
@@ -88,17 +88,17 @@ export function openStore(filePath) {
     setPaused(reason, at = Date.now()) { state.paused = reason ? { reason, at } : null; persist(); },
     setExit(reason, at = Date.now()) { state.exit = reason ? { reason, at } : null; persist(); },
 
-    // --- per-agent (per-room) token accounting, for stats + budget guard ---
+    // --- per-agent (per-room) token accounting: a LIFETIME cumulative meter.
+    //     Only grows; never reset except by an explicit `concord budget --reset`. ---
     getUsage(roomId) { return { ...usageState(roomId) }; },
-    addUsage(roomId, fresh, cached, now) {
+    addUsage(roomId, fresh, cached) {
       const u = usageState(roomId);
-      if (u.windowStart == null) u.windowStart = now;
       u.fresh += fresh || 0; u.cached += cached || 0; u.turns += 1;
       persist();
     },
-    resetUsage(roomId, now) {
+    resetUsage(roomId) {
       const u = usageState(roomId);
-      u.fresh = 0; u.cached = 0; u.turns = 0; u.windowStart = now;
+      u.fresh = 0; u.cached = 0; u.turns = 0;
       persist();
     },
 

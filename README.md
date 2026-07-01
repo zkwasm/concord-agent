@@ -53,6 +53,18 @@ concord help
 
 Hosts run in the background by default (`--fg` to stay foreground). `<agent>`: `claude` (default) | `codex` | `gemini` | …
 
+### In-room commands
+
+Type these in the room (or a bound IM chat) — they act on the agent's session, not the shell. A small, safe allowlist; anything else starting with `/` is just a normal message.
+
+- **`/compact`** — compact (summarize) the agent's context to free room. A real turn, so its token cost is counted.
+- **`/clear`** — reset the agent to an empty context (recycles its session). Keeps its name, room membership, IM binding, and the cumulative token meter — only the agent's memory is wiped.
+- **`/context`** — show how much of the context window is in use (read-only).
+- **`/usage`** (`/stats`, `用量`) — cumulative token usage for this agent.
+- **`/help`** — list the in-room commands.
+
+Capability/permission/model/identity commands (`/model`, `/permissions`, `/add-dir`, `/login`, …) are deliberately **not** accepted from a room message, so chat can never widen the agent's scope.
+
 ### Fleet lifecycle — stop for the night, pick up where you left off
 
 - **`concord shutdown`** stops the IM owner and every agent but **keeps** their configs and IM bindings — reversible. `concord list` still shows them (as `stopped`).
@@ -81,7 +93,7 @@ Concord room  <--REST long-poll-->  concord-agent (ACP client)  <--stdio-->  age
 The core guarantee: a hosted agent must never become a silent, bottomless token sink. The defenses, all on by default:
 
 - **Per-turn ceiling** — every single turn is bounded by a wall-clock timeout (`ACP_TURN_TIMEOUT`, default **1800s**; `0` disables). A degenerate/looping turn — or an adapter that never finishes — is cancelled and its process group killed, so one turn can't burn unbounded even with no `--budget`. Normal turns finish well under it. After a few consecutive timeouts the host pauses itself (so a slow-but-burning prompt, including resends, can't keep re-burning) until `concord resume`/`restart`.
-- **`--budget N`** caps *fresh* tokens per rolling window (`--budget-window-hours`, default 24); over budget pauses the agent and posts a note, with an 80%-of-budget early warning. `concord budget <id> --reset` / `concord resume <id>` clears the pause. `/usage` in-room shows current usage; `concord list` shows a live `TOK` column and `concord status` a `used` line.
+- **Token accounting is a lifetime cumulative meter** — usage per task/room only ever grows and is **never reset automatically** (not by time, a restart, `/compact`, or `/clear`), so you always see how many tokens a whole task actually consumed. The only way to zero it is an explicit **`concord budget <id> --reset`**. Optionally, **`--budget N`** sets a *lifetime* fresh-token ceiling: over it, the agent pauses and posts a note (with an 80% early warning) and resumes only via that same `--reset`. No cap (the default) → pure metering, never pauses. `concord resume <id>` clears a *timeout* pause **without** touching the meter. `/usage` in-room shows current usage; `concord list` shows a live `TOK` column and `concord status` a `used` line.
 - **Fail-loud** — a malformed `--budget` is rejected wherever the bridge runs (never silently "unlimited"); if an adapter reports no usage, a set `--budget` posts a warning *into the room* (it can't be measured, so the per-turn ceiling is the floor).
 - **Crash-loop & orphan guards** — a crash-looping adapter is rate-limited (exponential backoff, then pause + `concord restart`); an orphaned adapter group left by a dead supervisor is reaped before lifecycle commands and by `concord stop`/`prune`. The reap is **identity-guarded by the adapter's start-time**, so a recycled PID is never mistaken for ours and an innocent process group is never killed.
 

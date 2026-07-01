@@ -57,8 +57,8 @@ Usage:
   concord bindings                   List IM chat → room bindings (with health)
   concord stop <id> [--yes]          Stop + clean reclaim (--yes skips the working-agent prompt)
   concord restart <id> [--yes]       Stop then start again with the same config
-  concord budget <id> [--reset]      Show token usage / clear a budget pause
-  concord resume <id>                Clear a timeout/budget pause (accept tasks again)
+  concord budget <id> [--reset]      Show cumulative token usage / reset the counter (--reset)
+  concord resume <id>                Clear a timeout pause (accept tasks again; token meter kept)
   concord rm <id> [--yes] | prune    Stop + reclaim (if running) then remove an entry / drop dead ones
   concord shutdown                   Stop EVERYTHING (owner + agents) but KEEP configs + bindings (reversible)
   concord up                         Bring the whole fleet back after shutdown (bots need no re-binding)
@@ -103,7 +103,6 @@ const ago = (t) => { const s = Math.max(0, Math.round((Date.now() - t) / 1000));
 function buildSupArgs(f) {
   const a = [SUPERVISOR, f.agent, '--room', f.room, '--cwd', f.cwd, '--url', f.url];
   if (f.budget) a.push('--budget', String(f.budget));
-  if (f.budgetWindowHours) a.push('--budget-window-hours', String(f.budgetWindowHours));
   return a;
 }
 
@@ -232,7 +231,7 @@ async function startHost(mode, args) {
     agent: cfg.agent, mode, room, cwd, url: cfg.url, im, bound,
     ...(roomName ? { roomName } : {}),
     ...(cfg.label ? { label: cfg.label } : {}),
-    budget: cfg.budget || null, budgetWindowHours: cfg.budgetWindowHours || null,
+    budget: cfg.budget || null,
   };
   const pid = spawnDaemon(id, f, { fg });
   if (!fg) console.log(`✓ ${mode} started — id ${id} · pid ${pid} · agent ${cfg.agent} · room ${shortRoom(room)}${im ? ` · im ${im}` : ''}\n  concord logs ${id}   ·   concord stop ${id}`);
@@ -289,7 +288,7 @@ function statusHost(id) {
   lines.push(`url     ${h.url}   (api base)`);
   lines.push(`cwd     ${h.cwd}`);
   lines.push(`state   ${reg.statePath(h.id)}`);
-  lines.push(`budget  ${h.budget ? `${h.budget} fresh tok / ${h.budgetWindowHours || 24}h` : 'unlimited'}`);
+  lines.push(`budget  ${h.budget ? `${h.budget} fresh tok (lifetime cap)` : 'unlimited'}`);
   const u = readUsage(h.id, h.room);
   lines.push(`used    ${u ? `fresh ${u.fresh} · cache-read ${u.cached} · ${u.turns || 0} turns` : '(none yet)'}`);
   lines.push(`logs    concord logs ${h.id}`);
@@ -546,24 +545,35 @@ async function resetAll({ yes } = {}) {
   console.log('✓ reset —— 干净 slate。(登录凭据保留;在聊天里发 /concord-bind 重新绑定 bot。)');
 }
 
-// Clear a budget pause on a running host (SIGUSR1 — the daemon resets its window).
+// Clear a timeout pause on a running host (SIGUSR1 — unpause only; the token
+// meter is left untouched, resetting it is a separate explicit action).
 function resumeHost(id) {
   id = resolveId(id);
   const h = reg.get(id);
   if (!h) die(`no such host: ${id}`);
   if (!h.pid || !kill(h.pid, 'SIGUSR1')) die(`host ${id} is not running`);
-  console.log(`✓ resumed ${id} — budget window reset, accepting tasks again`);
+  console.log(`✓ resumed ${id} — accepting tasks again (token meter unchanged)`);
+}
+
+// Reset a host's lifetime token meter to zero (SIGUSR2). The ONLY thing that
+// clears the counter — it never happens automatically.
+function resetBudget(id) {
+  id = resolveId(id);
+  const h = reg.get(id);
+  if (!h) die(`no such host: ${id}`);
+  if (!h.pid || !kill(h.pid, 'SIGUSR2')) die(`host ${id} is not running`);
+  console.log(`✓ reset ${id} — token usage counter zeroed`);
 }
 
 function budgetCmd(id, args) {
   id = resolveId(id);
   const h = reg.get(id);
   if (!h) die(`no such host: ${id}`);
-  if (args.includes('--reset')) return resumeHost(id);
+  if (args.includes('--reset')) return resetBudget(id);
   let u = { fresh: 0, cached: 0, turns: 0 };
   try { u = JSON.parse(readFileSync(reg.statePath(id), 'utf8')).rooms?.[h.room]?.usage || u; } catch { /* no usage yet */ }
-  const cap = h.budget ? `${h.budget} fresh tok / ${h.budgetWindowHours || 24}h` : 'unlimited';
-  console.log(`budget  ${cap}\nused    fresh ${u.fresh} · cache-read ${u.cached} · ${u.turns || 0} turns\n(reset: concord budget ${id} --reset  or  concord resume ${id})`);
+  const cap = h.budget ? `${h.budget} fresh tok (lifetime cap)` : 'unlimited';
+  console.log(`budget  ${cap}\nused    fresh ${u.fresh} · cache-read ${u.cached} · ${u.turns || 0} turns (cumulative)\n(reset: concord budget ${id} --reset)`);
 }
 
 // Store this user's OWN IM bot creds locally (0600). Secret via --app-secret or,

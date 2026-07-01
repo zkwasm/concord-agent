@@ -33,17 +33,16 @@ export function usage() {
   --cwd <dir>                 Working directory the agent operates in (default: current dir)
   --url <url>                 Concord server base (default: https://concord.fenginwind.com; use http://localhost:3001 for local dev)
   --name <name>              Agent display name in the room (default: <agent>)
-  --budget <n>                Max fresh tokens per window, then pause (default: unlimited)
-  --budget-window-hours <h>   Rolling budget window in hours (default: 24)
+  --budget <n>                Lifetime fresh-token cap, then pause (default: unlimited; reset via "concord budget --reset")
   --model <m>                 Shown in the self-introduction (display only)
   --effort <e>                Shown in the self-introduction (display only)
   --public-url <url>          Public Concord base for the browser connect link (default: --url)
   -h, --help                  Show this help
 
-  In-room commands:  /usage — show token usage for this agent
+  In-room commands:  /compact (compact context) · /clear (fresh session) · /context (context usage) · /usage (cumulative tokens) · /help
 
   Env equivalents (flag wins): CONCORD_ROOM_ID, AGENT_CWD, CONCORD_URL, AGENT_NAME,
-  AGENT_TOKEN_BUDGET, AGENT_BUDGET_WINDOW_HOURS, AGENT_MODEL, AGENT_EFFORT, ACP_ADAPTER_CMD, ACP_PERMISSION.`;
+  AGENT_TOKEN_BUDGET, AGENT_MODEL, AGENT_EFFORT, ACP_ADAPTER_CMD, ACP_PERMISSION.`;
 }
 
 // Resolve effective config. roomId / cwd default to null so the caller can decide
@@ -61,8 +60,7 @@ export function resolveConfig(argv, env = {}) {
     roomId: flags.room ?? positional[1] ?? env.CONCORD_ROOM_ID ?? null,      // --room > positional (concord join <agent> <room>) > env > web handoff
     model: pick('model', 'AGENT_MODEL', ''),
     effort: pick('effort', 'AGENT_EFFORT', ''),
-    budget: pick('budget', 'AGENT_TOKEN_BUDGET', null),                       // max fresh tokens / window; null = unlimited
-    budgetWindowHours: pick('budget-window-hours', 'AGENT_BUDGET_WINDOW_HOURS', null), // rolling window, default 24h
+    budget: pick('budget', 'AGENT_TOKEN_BUDGET', null),                       // lifetime max fresh tokens; null = unlimited (pure metering)
     label: pick('as', 'CONCORD_LABEL', null),                                // --as <label>: a memorable handle for `concord list`/`stop`/… (registry metadata only)
     im: pick('im', 'ACP_IM', null),                                          // 'lark' | 'feishu' — bridge this host's room to your IM bot
     bind: flags.bind ?? null,                                                // --bind <chat_id>: bind this host's room to an IM chat (the `concord im` owner relays)

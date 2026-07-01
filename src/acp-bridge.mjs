@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { openStore } from './store.mjs';
 import { toolToProgress, toolDetail } from './render.mjs';
 import { resolveConfig, usage } from './cli.mjs';
-import { overBudget, windowElapsed, usageReport, budgetExceededNote } from './budget.mjs';
+import { overBudget, usageReport, budgetExceededNote } from './budget.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { createEngine } from './engine.mjs';
 import { procStart } from './reclaim.mjs';
@@ -45,9 +45,7 @@ if (cfg.budget != null && cfg.budget !== '' && !/^[1-9]\d*$/.test(String(cfg.bud
   console.error(`✗ AGENT_TOKEN_BUDGET/--budget must be a positive integer (got "${cfg.budget}"); refusing to run unguarded.`);
   process.exit(1);
 }
-const AGENT_TOKEN_BUDGET = parseInt(cfg.budget, 10) || 0;                 // max fresh tokens / window; 0 = unlimited
-const BUDGET_WINDOW_HOURS = parseFloat(cfg.budgetWindowHours) || 24;      // rolling window for the budget
-const BUDGET_WINDOW_MS = BUDGET_WINDOW_HOURS * 3600 * 1000;
+const AGENT_TOKEN_BUDGET = parseInt(cfg.budget, 10) || 0;                 // lifetime max fresh tokens; 0 = unlimited (pure metering)
 // Progress output (self-intro / ack / progress cards) is for a HUMAN watching. In a
 // multi-agent room (join mode) it pollutes the room + burns other agents' tokens,
 // so it's gated. host→on, join→off (set via ACP_PROGRESS by the CLI); default on.
@@ -65,7 +63,7 @@ function introText() {
   if (AGENT_MODEL) bits.push(`模型 ${AGENT_MODEL}`);
   if (AGENT_EFFORT) bits.push(`effort ${AGENT_EFFORT}`);
   bits.push(`工作目录 ${AGENT_CWD}`);
-  if (AGENT_TOKEN_BUDGET > 0) bits.push(`额度 ${AGENT_TOKEN_BUDGET} fresh tok/${BUDGET_WINDOW_HOURS}h(/usage 查)`);
+  if (AGENT_TOKEN_BUDGET > 0) bits.push(`额度 ${AGENT_TOKEN_BUDGET} fresh tok 累计上限(/usage 查)`);
   return bits.join(' · ') + '。把任务发给我。';
 }
 
@@ -183,7 +181,7 @@ let busy = false;
 const pending = [];
 let engine = null;
 let usageWarned = false;
-let warned80 = false;                 // one-time 80%-of-budget room note (per window)
+let warned80 = false;                 // one-time 80%-of-budget room note (until an explicit reset)
 let recreateTimes = [];               // timestamps of recent engine recreates (crash-loop guard)
 const RECREATE_WINDOW_MS = 5 * 60 * 1000;
 const RECREATE_MAX = 5;               // max engine recreates per window before we pause
@@ -259,22 +257,22 @@ async function runTurn(text) {
   return { reply, usage };
 }
 
-// Roll the budget window, then report whether the fresh-token cap is hit — so a
-// runaway agent can't burn unbounded cost while nobody's watching.
-function budgetBlocked(now) {
-  if (windowElapsed(store.getUsage(CONCORD_ROOM_ID).windowStart, now, BUDGET_WINDOW_MS)) { store.resetUsage(CONCORD_ROOM_ID, now); warned80 = false; }
+// Whether the lifetime fresh-token cap is hit — so a runaway agent can't burn
+// unbounded cost while nobody's watching. No cap (0) → never blocks. The counter
+// is never auto-reset; an over-cap agent resumes only via `concord budget --reset`.
+function budgetBlocked() {
   return overBudget(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET);
 }
-const budgetNote = (imChat) => out(budgetExceededNote(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET, BUDGET_WINDOW_HOURS), imChat);
+const budgetNote = (imChat) => out(budgetExceededNote(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET), imChat);
 
 // Early-warning so spend is VISIBLE before the cap pauses the agent: one room note
-// when usage first crosses 80% of the budget this window. No-op if no budget.
+// when cumulative usage first crosses 80% of the budget. No-op if no budget.
 function maybeBudgetWarn() {
   if (!AGENT_TOKEN_BUDGET || warned80) return;
   const u = store.getUsage(CONCORD_ROOM_ID);
   if (u.fresh >= AGENT_TOKEN_BUDGET * 0.8) {
     warned80 = true;
-    out(`⚠️ 已用 ${u.fresh}/${AGENT_TOKEN_BUDGET} fresh tok(≥80%),接近本窗口预算上限。`);
+    out(`⚠️ 已用 ${u.fresh}/${AGENT_TOKEN_BUDGET} fresh tok(≥80%),接近累计预算上限。`);
   }
 }
 
@@ -285,7 +283,7 @@ async function drain() {
     while (pending.length) {
       if (paused) { pending.length = 0; break; }
       const item = pending[0];                                 // peek: reply/notes target THIS message's IM chat
-      if (budgetBlocked(Date.now())) { await budgetNote(item.imChat); pending.length = 0; break; } // drop queued; over budget
+      if (budgetBlocked()) { await budgetNote(item.imChat); pending.length = 0; break; } // drop queued; over budget
       // Self-heal: a dead engine (adapter crash / dropped connection) is rebuilt
       // before the turn. If it won't come back, tell the user and stop draining;
       // the next inbound message retries (poll waits 30s → no tight crash loop).
@@ -300,7 +298,7 @@ async function drain() {
       try {
         const { reply, usage } = await runTurn(item.text);
         recreateTimes = [];                                    // a clean turn means the engine recovered → reset the crash-loop guard
-        store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached, Date.now());
+        store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached);
         maybeBudgetWarn();                                     // surface 80%-of-budget before the cap pauses us
         // Never go silent: a clean turn can end with no assistant text (Claude Code
         // sometimes puts the conclusion in a post_turn_summary the ACP adapter drops).
@@ -340,15 +338,49 @@ async function drain() {
 
 // One inbound message (from the room poll OR the IM bridge) → maybe ack/intro, then
 // queue a turn. imChat = the IM chat to reply into (null for a Concord-room message).
+// In-room slash commands passed to the agent VERBATIM — the ACP adapter only
+// treats a prompt as a command when the text ITSELF starts with "/", so these
+// must NOT carry the `[sender]` prefix. Small, safe allowlist: session-context
+// management only. Capability/permission/identity commands are deliberately
+// absent (a room message must never change the agent's scope); anything not
+// listed stays an attributed chat line (default-deny).
+const PASSTHROUGH_SLASH = new Set(['/compact', '/context']);
+const ROOM_HELP = '📋 房内命令:/compact 压缩上下文 · /clear 清空上下文(重开 session) · /context 查看上下文占用 · /usage 累计用量 · /help 本帮助';
+
+// `/clear` — reset the agent to an EMPTY context by recycling its engine (a fresh
+// ACP adapter+agent subprocess). Only the LLM side is swapped: room identity
+// (senderName + room session), IM binding, and the lifetime usage meter live at
+// module level / are owned elsewhere and are left untouched — the agent stays in
+// the room, same name, same bindings, just with a blank mind. NOT a passthrough:
+// the adapter marks `/clear` unsupported, so the ACP-native path is a new session.
+async function clearSession(imChat) {
+  if (busy) { await out('⏳ agent 正忙,当前 turn 结束后再 /clear。', imChat); return; }
+  console.log('🧹 /clear → recycling engine for a fresh session');
+  store.setActivity('working', '/clear');
+  try {
+    if (engine) { try { await engine.shutdown(); } catch { /* best effort */ } }
+    await startEngine();                                    // fresh adapter + empty-context session; joinRoom/startIm/meter untouched
+    store.setActivity('idle');
+    await out('🧹 已清空 agent 上下文,从零开始(名字、房间、绑定、用量计数都不变)。', imChat);
+  } catch (e) {
+    // Room/IM/identity layer is intact; the engine is left dead and the next message
+    // rebuilds it via ensureEngine (same as a crash) — so we never lose the room.
+    store.setActivity('idle');
+    await out(`⚠️ 清空失败:${String(e?.message || e).slice(0, 120)}(下条消息会自动重试起 agent)。`, imChat).catch(() => {});
+  }
+}
+
 async function handleInbound({ text, sender, imChat = null }) {
   const content = (text || '').trim();
   if (!content) return;
   if (['/usage', '/stats', '用量'].includes(content)) {       // pure query — no turn, no ack
-    await out(usageReport(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET, BUDGET_WINDOW_HOURS), imChat);
+    await out(usageReport(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET), imChat);
     return;
   }
+  if (content === '/help') { await out(ROOM_HELP, imChat); return; }   // pure query — list in-room commands
+  if (content === '/clear') { await clearSession(imChat); return; }    // recycle the agent's session → empty context (identity/binding/meter kept)
   if (paused) { if (im && imChat) im.send(imChat, '⏸️ 已暂停(多次超时);让 owner 跑 `concord resume`/`restart` 后再发。').catch(() => {}); return; }
-  if (budgetBlocked(Date.now())) { await budgetNote(imChat); return; }   // over budget → refuse cleanly
+  if (budgetBlocked()) { await budgetNote(imChat); return; }   // over budget → refuse cleanly
   // Self-intro + ack ONLY when this agent owns its own IM bridge (`--im`). In `--bind` mode the
   // `concord im` owner is the user-facing acker ("🤖 Claude 正在处理…"), so a second ack here
   // would double up in the chat (the owner relays our room posts back). Progress cards + the
@@ -356,7 +388,9 @@ async function handleInbound({ text, sender, imChat = null }) {
   if (PROGRESS && IM_PLATFORM && !store.wasIntroduced(CONCORD_ROOM_ID)) { await out(introText(), imChat); store.setIntroduced(CONCORD_ROOM_ID); }
   if (PROGRESS && IM_PLATFORM) await out(nextAck(), imChat);   // instant "收到" before the agent works (self-owned IM only)
   console.log(`→ agent | ${sender}: ${content}`);
-  pending.push({ text: `[${sender}] ${content}`, imChat });
+  // Allowlisted session-control slash → verbatim (no prefix) so the adapter executes it; else attributed chat.
+  const isSlash = PASSTHROUGH_SLASH.has(content.split(/\s+/, 1)[0]);
+  pending.push({ text: isSlash ? content : `[${sender}] ${content}`, imChat });
   drain();
 }
 
@@ -404,9 +438,12 @@ process.on('unhandledRejection', (reason) => { console.error('unhandledRejection
 // A FATAL uncaught error still crashes the supervisor (exit 1) — but record WHY first,
 // so `concord status` can show the reason instead of a bare "crashed".
 process.on('uncaughtException', (e) => { try { store.setExit('uncaught: ' + (e?.message || e)); } catch { /* best effort */ } console.error('uncaughtException:', e); process.exit(1); });
-// `concord resume` / `concord budget --reset` signals us to clear a budget pause
-// without a restart (we own the in-memory usage, so a file edit wouldn't be seen).
-process.on('SIGUSR1', () => { store.resetUsage(CONCORD_ROOM_ID, Date.now()); warned80 = false; paused = false; timeoutTimes = []; store.setPaused(null); store.setActivity('idle'); console.log('SIGUSR1 → budget window reset + unpaused; accepting tasks again'); });
+// `concord resume` (SIGUSR1) clears a timeout pause WITHOUT touching the usage
+// meter. `concord budget --reset` (SIGUSR2) is the ONLY thing that zeroes the
+// lifetime token counter — the daemon owns the in-memory usage, so a file edit
+// wouldn't be seen. Kept separate so resuming never silently wipes the meter.
+process.on('SIGUSR1', () => { paused = false; timeoutTimes = []; store.setPaused(null); store.setActivity('idle'); console.log('SIGUSR1 → unpaused; accepting tasks again'); });
+process.on('SIGUSR2', () => { store.resetUsage(CONCORD_ROOM_ID); warned80 = false; store.setActivity('idle'); console.log('SIGUSR2 → token usage counter reset'); });
 
 await joinRoom();
 try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}\n  (first run fetches the ACP adapter via npx — check network access to the npm registry, or pre-warm it by running the command printed above)`); }

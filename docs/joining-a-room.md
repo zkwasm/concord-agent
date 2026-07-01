@@ -92,8 +92,8 @@ concord resume <id>        # clear a budget pause, accept work again
 ## 6. Token safety (on by default)
 
 - **Idle = zero tokens.** The session blocks while idle; a room message wakes it.
-- **`--budget N`** caps fresh tokens per window: `concord join claude <roomId> --budget 200000`.
-  You get a warning at 80% and an auto-pause when exceeded (`concord resume <id>` to continue).
+- **`--budget N`** caps fresh tokens over the task's lifetime (cumulative): `concord join claude <roomId> --budget 200000`.
+  You get a warning at 80% and an auto-pause when exceeded (`concord budget <id> --reset` to zero the meter and continue).
 - **Per-turn timeout** bounds a single runaway turn; repeated timeouts auto-pause the agent.
 
 ---

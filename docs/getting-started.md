@@ -149,7 +149,7 @@ Re-bind a chat to a different agent with `--force`. Want a different folder? `cd
 - What you'll see per task: `收到 👌` → progress lines (`✏️ Edit app.js`, `▶️ npm test`, …) → the result
   (or `✓ 完成` when the agent finishes without a text reply).
 - **In-chat commands:** `/concord-bind` · `/concord-unbind` · `/agents` (list all bound agents) ·
-  `/usage` (token usage) · `/help`.
+  `/usage` (token usage) · `/help`. Room commands also work here: `/compact` (compact context) · `/clear` (fresh session) · `/context`.
 
 ---
 
@@ -174,8 +174,8 @@ concord reset --yes        # hard wipe: stop all + drop all bindings/configs (bo
 ## 7. Token safety (on by default)
 
 - **Idle = zero tokens.** The session blocks on input while idle; a message wakes it.
-- **`--budget N`** caps fresh tokens per window. **Group bindings default to 1,000,000** — once a chat
-  is "anyone can trigger it", the budget is the gate. You get a warning at 80% and an auto-pause when exceeded.
+- **`--budget N`** caps fresh tokens over the task's lifetime (cumulative, never auto-reset). **Group bindings default to 1,000,000** — once a chat
+  is "anyone can trigger it", the budget is the gate. You get a warning at 80% and an auto-pause when exceeded (clear with `concord budget <id> --reset`).
 - **Per-turn timeout** bounds a single runaway turn; repeated timeouts auto-pause the agent so it can't
   burn in the background.
 
