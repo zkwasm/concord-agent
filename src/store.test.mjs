@@ -99,6 +99,16 @@ test('acp session id: survives reopen for warm resume; cleared by /clear', () =>
   assert.equal(openStore(path).getAcpSessionId('r'), null);        // a wiped session is never resumed
 });
 
+test('warned80: persists across reopen (no re-warn on restart); cleared by resetUsage', () => {
+  const path = freshPath();
+  const s = openStore(path);
+  assert.equal(s.getWarned80('r'), false);
+  s.setWarned80('r');
+  assert.equal(openStore(path).getWarned80('r'), true);   // a crash-looping host must not re-post the warning
+  s.resetUsage('r');                                      // fresh meter → warning may fire again
+  assert.equal(openStore(path).getWarned80('r'), false);
+});
+
 test('context usage: live window meter round-trips', () => {
   const path = freshPath();
   const s = openStore(path);

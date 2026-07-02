@@ -2,6 +2,13 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.2 — 2026-07-02 (unreleased)
+
+### Fixed
+- **80%-of-budget warning re-posted after every restart.** The one-time flag was in-memory,
+  so a crash-looping host would spam the warning into the room on each incarnation. It is now
+  persisted with the usage meter and cleared only by `concord budget --reset`.
+
 ## 0.7.1 — 2026-07-02
 
 Drop-in upgrade; restart running hosts (`concord shutdown && concord up`) to pick it up.

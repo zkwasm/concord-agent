@@ -182,7 +182,6 @@ let busy = false;
 const pending = [];
 let engine = null;
 let usageWarned = false;
-let warned80 = false;                 // one-time 80%-of-budget room note (until an explicit reset)
 let recreateTimes = [];               // timestamps of recent engine recreates (crash-loop guard)
 const RECREATE_WINDOW_MS = 5 * 60 * 1000;
 const RECREATE_MAX = 5;               // max engine recreates per window before we pause
@@ -334,10 +333,10 @@ const budgetNote = (imChat) => out(budgetExceededNote(store.getUsage(CONCORD_ROO
 // Early-warning so spend is VISIBLE before the cap pauses the agent: one room note
 // when cumulative usage first crosses 80% of the budget. No-op if no budget.
 function maybeBudgetWarn() {
-  if (!AGENT_TOKEN_BUDGET || warned80) return;
+  if (!AGENT_TOKEN_BUDGET || store.getWarned80(CONCORD_ROOM_ID)) return;   // persisted: a restart must not re-warn
   const u = store.getUsage(CONCORD_ROOM_ID);
   if (u.fresh >= AGENT_TOKEN_BUDGET * 0.8) {
-    warned80 = true;
+    store.setWarned80(CONCORD_ROOM_ID);
     out(`⚠️ 已用 ${u.fresh}/${AGENT_TOKEN_BUDGET} fresh tok(≥80%),接近累计预算上限。`);
   }
 }
@@ -524,7 +523,7 @@ process.on('uncaughtException', (e) => { try { store.setExit('uncaught: ' + (e?.
 // lifetime token counter — the daemon owns the in-memory usage, so a file edit
 // wouldn't be seen. Kept separate so resuming never silently wipes the meter.
 process.on('SIGUSR1', () => { paused = false; timeoutTimes = []; store.setPaused(null); store.setActivity('idle'); console.log('SIGUSR1 → unpaused; accepting tasks again'); });
-process.on('SIGUSR2', () => { store.resetUsage(CONCORD_ROOM_ID); warned80 = false; store.setActivity('idle'); console.log('SIGUSR2 → token usage counter reset'); });
+process.on('SIGUSR2', () => { store.resetUsage(CONCORD_ROOM_ID); store.setActivity('idle'); console.log('SIGUSR2 → token usage counter reset'); });
 
 await joinRoom();
 try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}\n  (first run fetches the ACP adapter via npx — check network access to the npm registry, or pre-warm it by running the command printed above)`); }

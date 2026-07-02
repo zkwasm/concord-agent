@@ -107,8 +107,13 @@ export function openStore(filePath) {
     resetUsage(roomId) {
       const u = usageState(roomId);
       u.fresh = 0; u.cached = 0; u.turns = 0;
+      roomState(roomId).warned80 = false;   // fresh meter → the 80% warning may fire again
       persist();
     },
+    // One-time 80%-of-budget warning flag. Persisted so a crash-looping host
+    // doesn't re-post the warning on every restart; cleared only by resetUsage.
+    getWarned80(roomId) { return !!roomState(roomId).warned80; },
+    setWarned80(roomId) { roomState(roomId).warned80 = true; persist(); },
 
     persist,
     _state: () => state, // test hook
