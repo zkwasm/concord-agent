@@ -237,6 +237,7 @@ async function startEngine() {
   // keeps the agent's context. Falls back to a fresh session inside the engine.
   engine = createEngine({ agent: AGENT, cwd: AGENT_CWD, permission: PERMISSION_POLICY, log: console.log, resumeSessionId: store.getAcpSessionId(CONCORD_ROOM_ID), onElicitation: handleElicitation });
   await engine.ready;
+  briefed = engine.resumed();   // a resumed session was already briefed; a fresh one gets the briefing on its first turn
   store.setAcpSessionId(CONCORD_ROOM_ID, engine.sessionId());
   const apid = engine.adapterPid();
   // Record the adapter's start-time so an orphan reap can't kill a recycled pid. A null
@@ -282,7 +283,20 @@ function planCard(entries) {
   return `📋 计划 ${done}/${entries.length}\n${lines.join('\n')}`;
 }
 
+// One-time in-session briefing so the agent KNOWS it is already inside the room.
+// Without it, a Claude that also has the concord PLUGIN installed sees room-style
+// messages ("@评审 …"), concludes it never formally joined, and starts suggesting
+// `/concord:resume` / touching .concord/ — pure confusion. Prepended to the FIRST
+// turn of every fresh session (a resumed session already has it in context).
+let briefed = false;
+const briefing = () =>
+  `[concord-agent bridge] You are ALREADY connected to Concord room ${CONCORD_ROOM_ID} as "${senderName}". ` +
+  `This bridge relays room messages to you as "[sender] text" and posts your replies back to the room automatically. ` +
+  `Do NOT run or suggest any /concord:* plugin commands (join/resume/stop) and do NOT read or write .concord/ state — the bridge owns all room I/O. ` +
+  `Just do the work and reply normally.`;
+
 async function runTurn(text) {
+  if (!briefed) { briefed = true; text = `${briefing()}\n\n${text}`; }
   const toolState = new Map();
   const onUpdate = (u) => {
     // Live context-window meter (tokens in context / window size) → store, so

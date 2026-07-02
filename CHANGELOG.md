@@ -2,6 +2,16 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.4 — 2026-07-02 (unreleased)
+
+### Fixed
+- **Hosted agent no longer suggests `/concord:resume` / plugin commands.** A Claude that
+  also has the concord PLUGIN installed saw room-style messages, concluded it never
+  formally joined, and replied with "我没有自动接入 Concord 房间…用 /concord:resume 入场"
+  noise. The bridge now prepends a one-time briefing to the first turn of every fresh
+  session: you are ALREADY in room X as "name", the bridge owns all room I/O, never run
+  /concord:* or touch .concord/. Resumed sessions already carry it in context.
+
 ## 0.7.3 — 2026-07-02
 
 ### Fixed
