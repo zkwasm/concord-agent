@@ -22,6 +22,15 @@ old still-running daemon would mishandle.
 - **Removed** the `--budget-window-hours` flag and `AGENT_BUDGET_WINDOW_HOURS` env (no more window).
 
 ### Added
+- **Warm resume across restarts.** `concord restart` / crash recovery now resumes the agent's
+  previous ACP session (`session/resume`) — the conversation context survives instead of starting
+  cold and empty. Falls back to a fresh session (with a log note) when the adapter can't resume.
+  `/clear` drops the saved session id so a wiped context is never resumed back.
+- **Live plan card.** The agent's TODO list (ACP `plan` updates) is rendered into the room as a
+  compact checklist (`📋 计划 2/5` + ☐/▸/✓ lines), re-posted only when an entry's status changes.
+  Progress-gated like tool cards.
+- **Live context-window meter.** ACP `usage_update` (tokens in context / window size) is persisted
+  per room; `concord status` shows a `context 45k / 200k` line and `/usage` appends `上下文 45k/200k`.
 - **In-room commands** — type these in the room (or a bound IM chat) to manage the agent's session:
   - `/compact` — compact (summarize) the context (a real turn; its token cost is counted).
   - `/clear` — reset the agent to an empty context by recycling its session. Its **name, room

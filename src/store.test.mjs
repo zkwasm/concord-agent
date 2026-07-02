@@ -89,6 +89,27 @@ test('usage accounting: lifetime cumulative, reset only on demand, survive reope
   assert.deepEqual(s2.getUsage('r'), { fresh: 0, cached: 0, turns: 0 });
 });
 
+test('acp session id: survives reopen for warm resume; cleared by /clear', () => {
+  const path = freshPath();
+  const s = openStore(path);
+  assert.equal(s.getAcpSessionId('r'), null);
+  s.setAcpSessionId('r', 'acp-abc');
+  assert.equal(openStore(path).getAcpSessionId('r'), 'acp-abc');   // restart resumes this
+  s.setAcpSessionId('r', null);                                    // /clear drops it
+  assert.equal(openStore(path).getAcpSessionId('r'), null);        // a wiped session is never resumed
+});
+
+test('context usage: live window meter round-trips', () => {
+  const path = freshPath();
+  const s = openStore(path);
+  assert.equal(s.getContextUsage('r'), null);
+  s.setContextUsage('r', 45000, 200000);
+  const c = openStore(path).getContextUsage('r');
+  assert.equal(c.used, 45000);
+  assert.equal(c.size, 200000);
+  assert.ok(c.at > 0);
+});
+
 test('getUsage returns a copy (caller cannot mutate internal state)', () => {
   const s = openStore(freshPath());
   s.addUsage('r', 10, 0, 1);

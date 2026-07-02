@@ -18,12 +18,14 @@
 // race). The group pgid is exposed (`adapterPid`) so a supervisor can reap an
 // orphaned group even if this process died without running shutdown().
 //
-// NOTE (resume): every engine starts a FRESH ACP session (buildSession().start()).
-// The SDK's high-level ActiveSession is new-only; session/load + session/resume
-// exist but require the adapter to advertise the capability (claude-agent-acp
-// reports loadSession:false) and lower-level update routing. So a bridge restart
-// = fresh agent context (cold prompt cache). This is a known PoC limitation, not
-// acpx `--resume` parity — see README "Limitations".
+// NOTE (resume): pass `resumeSessionId` to warm-resume the agent's previous ACP
+// session across a restart — claude-agent-acp advertises sessionCapabilities.resume
+// and restores the SAME conversation context from its on-disk session files, so a
+// `concord restart` / crash recovery no longer means a cold, empty agent. The SDK's
+// high-level ActiveSession is new-only, so the resume path calls `session/resume`
+// directly and then `ctx.attachSession(...)` (a public runtime method, typed
+// private) to wire update routing. Any resume failure (old adapter, missing
+// session files, fresh machine) falls back to a fresh session.
 import { spawn } from 'node:child_process';
 import { Writable, Readable } from 'node:stream';
 import * as acp from '@agentclientprotocol/sdk';
@@ -115,7 +117,7 @@ const TURN_TIMEOUT = Symbol('turn-timeout');
 //   adapterPid  → the adapter process-GROUP pgid (or null in test mode)
 // Test seam: pass `_agentApp` (an in-process acp.agent({...}) AgentApp) to drive
 // the real engine without a subprocess.
-export function createEngine({ agent, cwd, permission = 'approve-all', log = console.log, turnTimeoutMs = TURN_TIMEOUT_MS, _agentApp = null } = {}) {
+export function createEngine({ agent, cwd, permission = 'approve-all', log = console.log, turnTimeoutMs = TURN_TIMEOUT_MS, resumeSessionId = null, _agentApp = null } = {}) {
   let child = null;
   let source;
   if (_agentApp) {
@@ -148,9 +150,20 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
   const app = acp.client({ name: 'concord' })
     .onRequest(acp.methods.client.session.requestPermission, (ctx) => decidePermission(ctx.params, permission));
 
+  let resumed = false;
   app.connectWith(source, async (ctx) => {
     await ctx.request(acp.methods.agent.initialize, { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
-    session = await ctx.buildSession(cwd).start();
+    if (resumeSessionId) {
+      try {
+        const resp = await ctx.request(acp.methods.agent.session.resume, { sessionId: resumeSessionId, cwd });
+        session = ctx.attachSession({ ...(resp || {}), sessionId: resumeSessionId });
+        resumed = true;
+        log(`▸ resumed agent session ${String(resumeSessionId).slice(0, 8)}… (context preserved)`);
+      } catch (e) {
+        log(`▸ could not resume the previous session (${String(e?.message || e).slice(0, 80)}) — starting fresh`);
+      }
+    }
+    if (!session) session = await ctx.buildSession(cwd).start();
     readyResolve(session.sessionId);
     await shutdownP;                          // hold the connection open across turns
     try { session.dispose(); } catch { /* already gone */ }
@@ -228,6 +241,7 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
     shutdown,
     ready,
     dead: () => failed,
+    resumed: () => resumed,
     sessionId: () => session?.sessionId ?? null,
     adapterPid: () => child?.pid ?? null,   // the adapter process-group pgid (stable for its lifetime)
   };

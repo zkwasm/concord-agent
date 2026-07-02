@@ -98,6 +98,40 @@ test('engine drives a real ACP turn in-process: reply + usage + progress + auto-
   await engine.shutdown();                                     // shutdown is awaitable
 });
 
+// ---- warm resume (session/resume + attachSession) ----
+test('resume: engine resumes the previous ACP session and prompts against it', async () => {
+  const captured = {};
+  const agent = acp.agent({ name: 'resumable' })
+    .onRequest('initialize', () => ({ protocolVersion: acp.PROTOCOL_VERSION, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } }))
+    .onRequest('session/new', () => { captured.newCalled = true; return { sessionId: 'sess-fresh' }; })
+    .onRequest('session/resume', (ctx) => { captured.resumedId = ctx.params.sessionId; return {}; })
+    .onRequest('session/prompt', (ctx) => {
+      captured.promptSession = ctx.params.sessionId;
+      return { stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1, cachedReadTokens: 0 } };
+    });
+  const engine = createEngine({ agent: 'claude', cwd: '/tmp', log: () => {}, resumeSessionId: 'sess-old-9', _agentApp: agent });
+  const { stopReason } = await engine.runTurn('continue');
+  assert.equal(captured.resumedId, 'sess-old-9');       // resume was requested with the saved id
+  assert.equal(captured.newCalled, undefined);          // no fresh session was created
+  assert.equal(captured.promptSession, 'sess-old-9');   // the turn ran against the RESUMED session
+  assert.equal(engine.resumed(), true);
+  assert.equal(engine.sessionId(), 'sess-old-9');
+  assert.equal(stopReason, 'end_turn');
+  await engine.shutdown();
+});
+
+test('resume: falls back to a fresh session when the agent cannot resume', async () => {
+  const agent = acp.agent({ name: 'no-resume' })
+    .onRequest('initialize', () => ({ protocolVersion: acp.PROTOCOL_VERSION, agentCapabilities: { loadSession: false } }))
+    .onRequest('session/new', () => ({ sessionId: 'sess-fresh-2' }))
+    .onRequest('session/prompt', () => ({ stopReason: 'end_turn', usage: {} }));
+  const engine = createEngine({ agent: 'claude', cwd: '/tmp', log: () => {}, resumeSessionId: 'sess-gone', _agentApp: agent });
+  await engine.ready;
+  assert.equal(engine.resumed(), false);                // resume failed → clean fallback, not a dead engine
+  assert.equal(engine.sessionId(), 'sess-fresh-2');
+  await engine.shutdown();
+});
+
 // --- usage mapper (per-turn vs cumulative; absent) ---
 test('makeUsageMapper: per-turn takes each turn as-is', () => {
   const map = makeUsageMapper('per-turn');

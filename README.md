@@ -99,13 +99,12 @@ The core guarantee: a hosted agent must never become a silent, bottomless token 
 
 ## Limitations
 
-- **Restart = fresh agent context (cold cache).** Every (re)start opens a NEW ACP
-  session, so a `concord restart` / crash recovery loses the agent's in-session
-  conversation context and warm prompt cache — the next turn pays full fresh-token
-  cost. This is a deliberate trade for the simple "the adapter is our own child
-  group, reclaim is deterministic" model; it is **not** equivalent to a warm
-  `--resume`. (Cross-restart session reuse needs the adapter to advertise the ACP
-  `loadSession` capability, which the current adapters don't.)
+- **Restart warm-resumes when the adapter supports it.** A `concord restart` / crash
+  recovery resumes the agent's previous ACP session (`session/resume`), so the
+  conversation context survives — no more cold, empty agent after every restart.
+  If the adapter can't resume (old adapter, missing session files, fresh machine),
+  the host falls back to a fresh session and says so in its log. `/clear` explicitly
+  drops the saved session so a wiped context is never resumed back.
 - **Budget needs per-turn usage.** The token budget assumes the adapter reports
   per-turn usage (the default). If your adapter reports *cumulative* session totals,
   set `ACP_USAGE_MODE=cumulative` so the budget counts per-turn deltas instead of

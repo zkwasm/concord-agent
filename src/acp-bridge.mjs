@@ -194,8 +194,11 @@ let paused = false;                   // hard pause (repeated timeouts) — `con
 // live, and record the adapter's process-group pgid so the CLI can reap it even if
 // we die without running cleanShutdown. Throws if the adapter won't start.
 async function startEngine() {
-  engine = createEngine({ agent: AGENT, cwd: AGENT_CWD, permission: PERMISSION_POLICY, log: console.log });
+  // Warm resume: hand the previous ACP session id back to the adapter so a restart
+  // keeps the agent's context. Falls back to a fresh session inside the engine.
+  engine = createEngine({ agent: AGENT, cwd: AGENT_CWD, permission: PERMISSION_POLICY, log: console.log, resumeSessionId: store.getAcpSessionId(CONCORD_ROOM_ID) });
   await engine.ready;
+  store.setAcpSessionId(CONCORD_ROOM_ID, engine.sessionId());
   const apid = engine.adapterPid();
   // Record the adapter's start-time so an orphan reap can't kill a recycled pid. A null
   // start (ps hiccup) would DISABLE the guard for this host, so retry a few times; if it
@@ -227,9 +230,39 @@ async function ensureEngine() {
 // progress card per tool (toolToProgress in render.mjs). ACP sends `tool_call`
 // (pending, empty input) then `tool_call_update`(s) that fill in title/path — so
 // we emit the enriched card once detail arrives (or on completion). Dedup by id.
+// Live plan (agent TODO list) → one compact checklist card per status change.
+// The agent replaces the whole plan on each update, so dedup by a signature of
+// entry statuses; re-post only when something actually moved. PROGRESS-gated.
+let lastPlanSig = '';
+function planCard(entries) {
+  const icon = { pending: '☐', in_progress: '▸', completed: '✓' };
+  const done = entries.filter((e) => e.status === 'completed').length;
+  const MAX = 12;
+  const lines = entries.slice(0, MAX).map((e) => `${icon[e.status] || '☐'} ${e.content}`);
+  if (entries.length > MAX) lines.push(`… +${entries.length - MAX} more`);
+  return `📋 计划 ${done}/${entries.length}\n${lines.join('\n')}`;
+}
+
 async function runTurn(text) {
   const toolState = new Map();
   const onUpdate = (u) => {
+    // Live context-window meter (tokens in context / window size) → store, so
+    // `concord status` and /usage can show it. No room post (too chatty).
+    if (u.sessionUpdate === 'usage_update') {
+      if (typeof u.used === 'number' && typeof u.size === 'number') store.setContextUsage(CONCORD_ROOM_ID, u.used, u.size);
+      return;
+    }
+    if (u.sessionUpdate === 'plan') {
+      const entries = Array.isArray(u.entries) ? u.entries : [];
+      if (!entries.length) return;
+      const sig = entries.map((e) => `${e.status}:${e.content}`).join('|');
+      if (sig === lastPlanSig) return;
+      lastPlanSig = sig;
+      const card = planCard(entries);
+      console.log(card.split('\n').map((l) => `  ${l}`).join('\n'));
+      if (PROGRESS) out(card);
+      return;
+    }
     if (u.sessionUpdate !== 'tool_call' && u.sessionUpdate !== 'tool_call_update') return;
     if (process.env.ACP_DEBUG_TOOLCALL) console.log('[raw tool_call]', JSON.stringify(u).slice(0, 600));
     const id = u.toolCallId || u.title || 'tool';
@@ -359,6 +392,8 @@ async function clearSession(imChat) {
   store.setActivity('working', '/clear');
   try {
     if (engine) { try { await engine.shutdown(); } catch { /* best effort */ } }
+    store.setAcpSessionId(CONCORD_ROOM_ID, null);           // a wiped session must NEVER be warm-resumed back
+    lastPlanSig = '';                                       // stale plan card must not suppress the fresh session's first plan
     await startEngine();                                    // fresh adapter + empty-context session; joinRoom/startIm/meter untouched
     store.setActivity('idle');
     await out('🧹 已清空 agent 上下文,从零开始(名字、房间、绑定、用量计数都不变)。', imChat);
@@ -374,7 +409,9 @@ async function handleInbound({ text, sender, imChat = null }) {
   const content = (text || '').trim();
   if (!content) return;
   if (['/usage', '/stats', '用量'].includes(content)) {       // pure query — no turn, no ack
-    await out(usageReport(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET), imChat);
+    const ctxUse = store.getContextUsage(CONCORD_ROOM_ID);
+    const ctxLine = ctxUse?.size ? ` · 上下文 ${Math.round(ctxUse.used / 1000)}k/${Math.round(ctxUse.size / 1000)}k` : '';
+    await out(usageReport(store.getUsage(CONCORD_ROOM_ID), AGENT_TOKEN_BUDGET) + ctxLine, imChat);
     return;
   }
   if (content === '/help') { await out(ROOM_HELP, imChat); return; }   // pure query — list in-room commands

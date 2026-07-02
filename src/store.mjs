@@ -54,6 +54,14 @@ export function openStore(filePath) {
     // --- per-room poll state (resume reads across restarts) ---
     getSessionId(roomId) { return roomState(roomId).sessionId; },
     setSessionId(roomId, sessionId) { roomState(roomId).sessionId = sessionId; persist(); },
+    // The agent's ACP session id (NOT the Concord-room session above). Persisted so a
+    // restart can `session/resume` the SAME agent context instead of starting cold.
+    // Cleared by /clear so a wiped session is never resumed.
+    getAcpSessionId(roomId) { return roomState(roomId).acpSessionId || null; },
+    setAcpSessionId(roomId, id) { roomState(roomId).acpSessionId = id || null; persist(); },
+    // Live context-window usage from ACP `usage_update` (tokens in context / window size).
+    setContextUsage(roomId, used, size) { roomState(roomId).context = { used, size, at: Date.now() }; persist(); },
+    getContextUsage(roomId) { return roomState(roomId).context || null; },
     // The sender name this session was joined as. MUST be resumed with the SAME name — the
     // server binds a session to its creating sender and 403s a post whose sender differs
     // (e.g. resuming a session created under a 409-fallback name "claude-1234" while claiming

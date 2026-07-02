@@ -291,6 +291,8 @@ function statusHost(id) {
   lines.push(`budget  ${h.budget ? `${h.budget} fresh tok (lifetime cap)` : 'unlimited'}`);
   const u = readUsage(h.id, h.room);
   lines.push(`used    ${u ? `fresh ${u.fresh} · cache-read ${u.cached} · ${u.turns || 0} turns` : '(none yet)'}`);
+  const cx = readContext(h.id, h.room);
+  if (cx?.size) lines.push(`context ${Math.round(cx.used / 1000)}k / ${Math.round(cx.size / 1000)}k tokens in window`);
   lines.push(`logs    concord logs ${h.id}`);
   console.log(lines.join('\n'));
 }
@@ -374,6 +376,10 @@ function clearAdapter(id) {
 // Live token usage for a host (so `list`/`status` can surface a burner at a glance).
 function readUsage(id, room) {
   try { return JSON.parse(readFileSync(reg.statePath(id), 'utf8')).rooms?.[room]?.usage ?? null; } catch { return null; }
+}
+// Live context-window usage (from ACP usage_update), written by the bridge.
+function readContext(id, room) {
+  try { return JSON.parse(readFileSync(reg.statePath(id), 'utf8')).rooms?.[room]?.context ?? null; } catch { return null; }
 }
 // Live runtime a host writes into its own state.json (activity / paused / exit), so
 // `list`/`status` can show what it's DOING and WHY it stopped — not just pid-liveness.
