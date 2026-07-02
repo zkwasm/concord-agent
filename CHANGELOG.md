@@ -2,7 +2,7 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
-## 0.7.3 — 2026-07-02 (unreleased)
+## 0.7.3 — 2026-07-02
 
 ### Fixed
 - **Ambient 'system' messages no longer wake the agent.** File-upload notices
