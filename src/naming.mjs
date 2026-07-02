@@ -12,7 +12,7 @@ import { basename } from 'node:path';
 
 // Best-effort room context via the agent API (the room id is the bearer token).
 export async function gatherRoomInfo(url, roomId, { fetchImpl = globalThis.fetch, timeoutMs = 4000 } = {}) {
-  const out = { roomName: '', purpose: '', agents: [] };
+  const out = { roomName: '', purpose: '', context: '', agents: [] };
   if (!url || !roomId) return out;
   const base = `${url.replace(/\/$/, '')}/agent/rooms/${roomId}`;
   const get = async (path) => {
@@ -23,26 +23,38 @@ export async function gatherRoomInfo(url, roomId, { fetchImpl = globalThis.fetch
     finally { clearTimeout(t); }
   };
   const [info, ag] = await Promise.all([get('/info'), get('/agents')]);
-  if (info) { out.roomName = info.name || ''; out.purpose = info.purpose || ''; }
+  if (info) { out.roomName = info.name || ''; out.purpose = info.purpose || ''; out.context = info.context || ''; }
   if (ag && Array.isArray(ag.agents)) out.agents = ag.agents;
   return out;
 }
 
-export function namingPrompt({ dir, agentType, roomName, purpose, agents }) {
+// The name doubles as the agent's ROLE and persona in the room (mirroring the
+// web paste-prompt: "ask the user what role you should play … use it as your
+// sender name and persona throughout"). So the headless call proposes ROLES that
+// fit the collaboration objective — not decorative labels.
+export function namingPrompt({ dir, agentType, roomName, purpose, context, agents }) {
   const lines = [
-    'You are helping name a new coding agent that is about to join a collaboration room.',
-    `Project directory: ${basename(dir || '') || '(unknown)'}`,
+    'A new coding agent is about to join a collaboration room. Its sender name doubles as its ROLE',
+    'and persona in the room — it is how humans decide who to @ and who owns which task.',
+    'Propose what role this agent should play.',
+    '',
+    `Project directory it works in: ${basename(dir || '') || '(unknown)'}`,
     `Agent runtime: ${agentType || 'claude'}`,
   ];
   if (roomName) lines.push(`Room name: ${roomName}`);
-  if (purpose) lines.push(`Room purpose: ${purpose.slice(0, 500)}`);
-  if (agents?.length) lines.push(`Already in the room (do NOT reuse or collide with these): ${agents.join(', ')}`);
+  if (purpose) lines.push(`Collaboration objective: ${purpose.slice(0, 500)}`);
+  if (context) lines.push(`Room context (may contain a "Suggested participant roles" / "Candidate roles" list): ${context.slice(0, 1200)}`);
+  if (agents?.length) lines.push(`Already in the room: ${agents.join(', ')}`);
   lines.push(
     '',
-    'Suggest 4 SHORT, readable names for this new agent. Requirements:',
-    '- Role-flavored where possible (what would this agent DO in this room?), e.g. "parser-dev", "评审", "前端组长".',
-    '- Each ≤ 16 characters, no spaces (hyphens ok), distinct from the existing members.',
-    '- Match the language of the room purpose (Chinese room → Chinese names ok).',
+    'Propose 4 candidate role names, best first. Rules:',
+    '- If the room context suggests participant roles, offer the untaken ones FIRST, verbatim.',
+    '- Otherwise derive roles from the objective + the project directory: what distinct viewpoint or',
+    '  responsibility would this agent OWN (implementer, reviewer, tester, researcher, designer, …)?',
+    '- Complement the existing members — pick roles clearly DIFFERENT from what is already covered;',
+    '  never reuse or collide with an existing name.',
+    '- Write role names in the same language as the collaboration objective.',
+    '- Each ≤ 16 characters, no spaces (hyphens ok). Concrete beats generic ("支付-评审" beats "helper").',
     '- Output ONLY a JSON array of 4 strings. No prose, no markdown fence.',
   );
   return lines.join('\n');

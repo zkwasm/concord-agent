@@ -3,10 +3,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { namingPrompt, parseCandidates, fallbackCandidates, suggestNames, runHeadlessClaude } from './naming.mjs';
 
-test('namingPrompt: carries dir, room context and taken names', () => {
-  const p = namingPrompt({ dir: '/x/parser-service', agentType: 'claude', roomName: '支付重构', purpose: '重构支付系统', agents: ['工程师'] });
+test('namingPrompt: role-framing + dir, room objective/context, taken names', () => {
+  const p = namingPrompt({ dir: '/x/parser-service', agentType: 'claude', roomName: '支付重构', purpose: '重构支付系统', context: 'Suggested participant roles: 评审, 实现', agents: ['工程师'] });
+  assert.match(p, /ROLE/);                                  // names are roles, not labels
   assert.match(p, /parser-service/);
   assert.match(p, /支付重构/);
+  assert.match(p, /Suggested participant roles: 评审, 实现/); // room context flows through
+  assert.match(p, /untaken ones FIRST/);                     // context roles take priority
   assert.match(p, /工程师/);
   assert.match(p, /JSON array/);
 });
