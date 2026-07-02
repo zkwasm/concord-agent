@@ -2,6 +2,29 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.1 — 2026-07-02 (unreleased)
+
+Drop-in upgrade; restart running hosts (`concord shutdown && concord up`) to pick it up.
+
+### Added
+- **Agent-initiated questions in chat (elicitation).** When the agent needs a decision
+  (Claude's `AskUserQuestion` tool, or an MCP-server elicitation), the question now appears in the
+  room / bound IM chat as a numbered card — reply with the option number (`2`), multi-select with
+  commas (`1,3`), free text for a custom answer, or `skip`. The answer flows back into the agent's
+  turn and it continues. Answers are only taken from **humans** (other agents' chatter in a
+  multi-agent room is queued as normal work, never consumed as an answer); one open question at a
+  time; unanswered questions time out (`ACP_ELICIT_TIMEOUT`, default 600s) and the agent proceeds.
+  Verified live end-to-end against the real adapter.
+- **Warm resume across restarts.** `concord restart` / crash recovery now resumes the agent's
+  previous ACP session (`session/resume`) — the conversation context survives instead of starting
+  cold and empty. Falls back to a fresh session (with a log note) when the adapter can't resume.
+  `/clear` drops the saved session id so a wiped context is never resumed back. Verified live.
+- **Live plan card.** The agent's TODO list (ACP `plan` updates) is rendered into the room as a
+  compact checklist (`📋 计划 2/5` + ☐/▸/✓ lines), re-posted only when an entry's status changes.
+  Progress-gated like tool cards.
+- **Live context-window meter.** ACP `usage_update` (tokens in context / window size) is persisted
+  per room; `concord status` shows a `context 45k / 200k` line and `/usage` appends `上下文 45k/200k`.
+
 ## 0.7.0 — 2026-07-02
 
 Behavior change to token accounting + new in-room commands. **Upgrade is drop-in — bindings,
@@ -22,23 +45,6 @@ old still-running daemon would mishandle.
 - **Removed** the `--budget-window-hours` flag and `AGENT_BUDGET_WINDOW_HOURS` env (no more window).
 
 ### Added
-- **Agent-initiated questions in chat (elicitation).** When the agent needs a decision
-  (Claude's `AskUserQuestion` tool, or an MCP-server elicitation), the question now appears in the
-  room / bound IM chat as a numbered card — reply with the option number (`2`), multi-select with
-  commas (`1,3`), free text for a custom answer, or `skip`. The answer flows back into the agent's
-  turn and it continues. Answers are only taken from **humans** (other agents' chatter in a
-  multi-agent room is queued as normal work, never consumed as an answer); one open question at a
-  time; unanswered questions time out (`ACP_ELICIT_TIMEOUT`, default 600s) and the agent proceeds.
-  Verified live end-to-end against the real adapter.
-- **Warm resume across restarts.** `concord restart` / crash recovery now resumes the agent's
-  previous ACP session (`session/resume`) — the conversation context survives instead of starting
-  cold and empty. Falls back to a fresh session (with a log note) when the adapter can't resume.
-  `/clear` drops the saved session id so a wiped context is never resumed back.
-- **Live plan card.** The agent's TODO list (ACP `plan` updates) is rendered into the room as a
-  compact checklist (`📋 计划 2/5` + ☐/▸/✓ lines), re-posted only when an entry's status changes.
-  Progress-gated like tool cards.
-- **Live context-window meter.** ACP `usage_update` (tokens in context / window size) is persisted
-  per room; `concord status` shows a `context 45k / 200k` line and `/usage` appends `上下文 45k/200k`.
 - **In-room commands** — type these in the room (or a bound IM chat) to manage the agent's session:
   - `/compact` — compact (summarize) the context (a real turn; its token cost is counted).
   - `/clear` — reset the agent to an empty context by recycling its session. Its **name, room
