@@ -15,7 +15,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openStore } from './store.mjs';
 import { toolToProgress, toolDetail } from './render.mjs';
-import { resolveConfig, usage } from './cli.mjs';
+import { resolveConfig, usage, shouldRelayInbound } from './cli.mjs';
 import { overBudget, usageReport, budgetExceededNote } from './budget.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { createEngine } from './engine.mjs';
@@ -491,7 +491,7 @@ async function pollLoop() {
       const res = await fetch(`${room}/messages?session=${sessionId}&wait=30`);
       if (res.status === 401) { console.warn('Concord session expired → rejoin'); await joinRoom(); continue; }
       for (const m of (await res.json()).messages || []) {
-        if (m.sender === senderName) continue;
+        if (!shouldRelayInbound(m, senderName)) continue;   // own echoes + ambient 'system' notices never wake the agent
         if (store.wasProcessedInbound(m.id)) continue;   // already handled (resume / redelivery)
         store.markProcessedInbound(m.id);
         await handleInbound({ text: m.content, sender: m.sender, imChat: null, senderType: m.senderType || 'human' });   // room message → reply to room only

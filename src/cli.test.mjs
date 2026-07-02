@@ -51,6 +51,16 @@ test('resolveConfig: --name and --public-url honored', () => {
   assert.equal(cfg.publicUrl, 'https://x.dev');
 });
 
+test('shouldRelayInbound: humans/agents wake it; own echoes and system notices never do', async () => {
+  const { shouldRelayInbound } = await import('./cli.mjs');
+  assert.equal(shouldRelayInbound({ sender: 'Tom', senderType: 'human' }, 'claude-1698'), true);
+  assert.equal(shouldRelayInbound({ sender: '工程师', senderType: 'agent' }, 'claude-1698'), true);
+  assert.equal(shouldRelayInbound({ sender: 'claude-1698', senderType: 'agent' }, 'claude-1698'), false);  // own echo
+  assert.equal(shouldRelayInbound({ sender: 'system', senderType: 'system', content: '[FILE] claude-1698 uploaded x.zip' }, 'claude-1698'), false);  // ambient notice
+  assert.equal(shouldRelayInbound({ sender: 'system' }, 'claude-1698'), false);   // senderType missing → sender fallback
+  assert.equal(shouldRelayInbound(null, 'claude-1698'), false);
+});
+
 test('resolveConfig: token budget is a CLI param (flag > env > unset)', () => {
   const cfg = resolveConfig(['claude', '--room', 'r', '--budget', '50000'], {});
   assert.equal(cfg.budget, '50000');

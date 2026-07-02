@@ -69,3 +69,14 @@ export function resolveConfig(argv, env = {}) {
     progress: flags.progress === true ? true : (flags['no-progress'] === true ? false : (env.ACP_PROGRESS != null ? env.ACP_PROGRESS === '1' : null)),
   };
 }
+
+// Should a polled room message wake the agent? Own messages are echoes; 'system'
+// messages are ambient notifications (file-upload notices etc.) — feeding those to
+// the LLM burns a turn AND produces "no action needed" chatter back into the room,
+// wasting every other participant's tokens. Humans and other agents wake it.
+export function shouldRelayInbound(m, selfName) {
+  if (!m) return false;
+  if (m.sender === selfName) return false;
+  if (m.senderType === 'system' || m.sender === 'system') return false;
+  return true;
+}

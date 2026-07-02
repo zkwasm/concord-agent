@@ -15,6 +15,11 @@ All notable changes to `concord-agent`. Dates are UTC.
   non-TTY runs never prompt.
 
 ### Fixed
+- **Ambient 'system' messages no longer wake the agent.** File-upload notices
+  (`[FILE] x uploaded …`, sender_type=system) used to trigger a full LLM turn whose
+  reply ("no action needed, standing by") was posted back into the room — burning the
+  agent's tokens AND every other participant's. System notices are now filtered at the
+  poll loop, next to the own-echo skip. Humans and other agents still wake it.
 - **`concord list`/`status` now show the agent's ACTUAL in-room name.** The first column
   (now `NAME`) reads the persisted room sender, so whatever the roster shows is exactly what
   the CLI shows — in every case, not just the fallback one. `status` adds a `name` line.
