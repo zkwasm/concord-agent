@@ -28,6 +28,30 @@ export async function gatherRoomInfo(url, roomId, { fetchImpl = globalThis.fetch
   return out;
 }
 
+// Room templates bake their role list into the room's context at creation
+// (compose.ts rolesBlock): a known header line followed by "- name: description"
+// lines. Extract the STRUCTURED role names — these are the room's own intended
+// participants, the highest-grade naming source there is (no LLM guessing).
+const ROLE_HEADERS = [
+  'Suggested participant roles:',
+  'Candidate roles (pick one no other agent has taken — 409 enforced):',
+  '建议的参与者角色:',
+  '候选角色(挑一个还没有其他 Agent 占用的 —— 由 409 强制保证唯一):',
+];
+export function extractTemplateRoles(context) {
+  const lines = String(context || '').split('\n');
+  const start = lines.findIndex((l) => ROLE_HEADERS.some((h) => l.trim().startsWith(h)));
+  if (start === -1) return [];
+  const out = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const m = /^\s*-\s*([^:::]+)[::]/.exec(lines[i]);
+    if (!m) break;                                   // the block ends at the first non-item line
+    const name = m[1].trim().replace(/\s+/g, '-');
+    if (name && name.length <= 24 && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
 // The name doubles as the agent's ROLE and persona in the room (mirroring the
 // web paste-prompt: "ask the user what role you should play … use it as your
 // sender name and persona throughout"). So the headless call proposes ROLES that
@@ -53,6 +77,8 @@ export function namingPrompt({ dir, agentType, roomName, purpose, context, agent
     '  responsibility would this agent OWN (implementer, reviewer, tester, researcher, designer, …)?',
     '- Complement the existing members — pick roles clearly DIFFERENT from what is already covered;',
     '  never reuse or collide with an existing name.',
+    '- GROUND every candidate in the provided objective / context / project directory — do NOT',
+    '  invent domains or duties they do not imply.',
     '- Write role names in the same language as the collaboration objective.',
     '- Each ≤ 16 characters, no spaces (hyphens ok). Concrete beats generic ("支付-评审" beats "helper").',
     '- Output ONLY a JSON array of 4 strings. No prose, no markdown fence.',
@@ -116,15 +142,24 @@ export function runHeadlessClaude(prompt, { timeoutMs = 30000, spawnImpl = spawn
   });
 }
 
-// Orchestrator: room context → headless suggestion → parsed candidates, with the
-// mechanical fallback appended so the picker never comes up empty.
+// Orchestrator, grounded-first: ① the room template's own role list (untaken
+// entries verbatim — deterministic, zero LLM); ② only when the template gives
+// nothing, a one-off headless call grounded on the room's purpose/context;
+// ③ dir-name fallback so the picker never comes up empty.
 export async function suggestNames({ dir, agentType, url, roomId, fetchImpl, runHeadless = runHeadlessClaude, log = () => {} } = {}) {
   const info = await gatherRoomInfo(url, roomId, { fetchImpl });
   const taken = info.agents || [];
+  const lower = new Set(taken.map((t) => String(t).trim().toLowerCase()));
+  const templateRoles = extractTemplateRoles(info.context).filter((r) => !lower.has(r.toLowerCase()));
+  if (templateRoles.length) {
+    log(`▸ 房间模板定义了参与者角色${info.roomName ? `(房间「${info.roomName}」)` : ''}——未被占用的:${templateRoles.join(', ')}`);
+    const candidates = [...templateRoles, ...fallbackCandidates(dir, [...taken, ...templateRoles])].slice(0, 5);
+    return { candidates, info, source: 'template' };
+  }
   log(`▸ 让一个一次性 headless agent 根据房间信息起名…${info.roomName ? `(房间「${info.roomName}」${taken.length ? ` · 在场: ${taken.join(', ')}` : ''})` : ''}`);
   const raw = await runHeadless(namingPrompt({ dir, agentType, ...info }));
   const llm = parseCandidates(raw, { taken });
   const fb = fallbackCandidates(dir, [...taken, ...llm]);
   const candidates = [...llm, ...fb].slice(0, 5);
-  return { candidates, info, fromLLM: llm.length > 0 };
+  return { candidates, info, source: llm.length ? 'headless' : 'fallback' };
 }
