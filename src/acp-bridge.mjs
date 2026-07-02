@@ -19,6 +19,7 @@ import { resolveConfig, usage } from './cli.mjs';
 import { overBudget, usageReport, budgetExceededNote } from './budget.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { createEngine } from './engine.mjs';
+import { parseForm, renderQuestion, parseReply } from './elicit.mjs';
 import { procStart } from './reclaim.mjs';
 
 if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) { console.log(usage()); process.exit(0); }
@@ -193,10 +194,42 @@ let paused = false;                   // hard pause (repeated timeouts) — `con
 // (Re)create the resident ACP engine: spawn the adapter, wait until the session is
 // live, and record the adapter's process-group pgid so the CLI can reap it even if
 // we die without running cleanShutdown. Throws if the adapter won't start.
+// ── Agent-initiated questions (ACP form elicitation) ───────────────────────
+// The agent's AskUserQuestion (or an MCP elicitation) arrives as a REQUEST that
+// blocks its turn until we answer. We post the question card to the room / IM,
+// then resolve with the first HUMAN reply (agents chattering in a multi-agent
+// room are queued as normal work, never consumed as answers). One at a time; a
+// timeout cancels so the turn can't hang past the per-turn ceiling.
+const ELICIT_TIMEOUT_MS = (parseInt(process.env.ACP_ELICIT_TIMEOUT ?? '600', 10) || 600) * 1000;
+let pendingElicit = null;   // { form, resolve, timer, imChat }
+
+function settleElicit(response) {
+  if (!pendingElicit) return;
+  clearTimeout(pendingElicit.timer);
+  const { resolve } = pendingElicit;
+  pendingElicit = null;
+  resolve(response);
+}
+
+async function handleElicitation(params) {
+  if (params?.mode !== 'form') return { action: 'cancel' };         // url-mode not advertised; belt & braces
+  if (pendingElicit) return { action: 'cancel' };                    // one open question at a time
+  const form = parseForm(params);
+  const imChat = currentImChat;
+  await out(renderQuestion(form), imChat).catch(() => {});
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      out(`⏳ ${Math.round(ELICIT_TIMEOUT_MS / 60000)} 分钟没有回答,已跳过该提问,agent 继续。`, imChat).catch(() => {});
+      settleElicit({ action: 'cancel' });
+    }, ELICIT_TIMEOUT_MS);
+    pendingElicit = { form, resolve, timer, imChat };
+  });
+}
+
 async function startEngine() {
   // Warm resume: hand the previous ACP session id back to the adapter so a restart
   // keeps the agent's context. Falls back to a fresh session inside the engine.
-  engine = createEngine({ agent: AGENT, cwd: AGENT_CWD, permission: PERMISSION_POLICY, log: console.log, resumeSessionId: store.getAcpSessionId(CONCORD_ROOM_ID) });
+  engine = createEngine({ agent: AGENT, cwd: AGENT_CWD, permission: PERMISSION_POLICY, log: console.log, resumeSessionId: store.getAcpSessionId(CONCORD_ROOM_ID), onElicitation: handleElicitation });
   await engine.ready;
   store.setAcpSessionId(CONCORD_ROOM_ID, engine.sessionId());
   const apid = engine.adapterPid();
@@ -391,6 +424,7 @@ async function clearSession(imChat) {
   console.log('🧹 /clear → recycling engine for a fresh session');
   store.setActivity('working', '/clear');
   try {
+    settleElicit({ action: 'cancel' });                     // an open question dies with the session it belongs to
     if (engine) { try { await engine.shutdown(); } catch { /* best effort */ } }
     store.setAcpSessionId(CONCORD_ROOM_ID, null);           // a wiped session must NEVER be warm-resumed back
     lastPlanSig = '';                                       // stale plan card must not suppress the fresh session's first plan
@@ -405,7 +439,7 @@ async function clearSession(imChat) {
   }
 }
 
-async function handleInbound({ text, sender, imChat = null }) {
+async function handleInbound({ text, sender, imChat = null, senderType = 'human' }) {
   const content = (text || '').trim();
   if (!content) return;
   if (['/usage', '/stats', '用量'].includes(content)) {       // pure query — no turn, no ack
@@ -416,6 +450,16 @@ async function handleInbound({ text, sender, imChat = null }) {
   }
   if (content === '/help') { await out(ROOM_HELP, imChat); return; }   // pure query — list in-room commands
   if (content === '/clear') { await clearSession(imChat); return; }    // recycle the agent's session → empty context (identity/binding/meter kept)
+  // An open agent question consumes the next HUMAN reply as its answer. Agent /
+  // system messages fall through to normal queueing — in a multi-agent room the
+  // other agents' chatter must never be mistaken for the human's choice.
+  if (pendingElicit && senderType === 'human') {
+    const r = parseReply(pendingElicit.form, content);
+    if (!r.ok) { await out(r.hint, imChat); return; }
+    console.log(`← answer | ${sender}: ${content}`);
+    settleElicit(r.response);
+    return;
+  }
   if (paused) { if (im && imChat) im.send(imChat, '⏸️ 已暂停(多次超时);让 owner 跑 `concord resume`/`restart` 后再发。').catch(() => {}); return; }
   if (budgetBlocked()) { await budgetNote(imChat); return; }   // over budget → refuse cleanly
   // Self-intro + ack ONLY when this agent owns its own IM bridge (`--im`). In `--bind` mode the
@@ -444,7 +488,7 @@ async function pollLoop() {
         if (m.sender === senderName) continue;
         if (store.wasProcessedInbound(m.id)) continue;   // already handled (resume / redelivery)
         store.markProcessedInbound(m.id);
-        await handleInbound({ text: m.content, sender: m.sender, imChat: null });   // room message → reply to room only
+        await handleInbound({ text: m.content, sender: m.sender, imChat: null, senderType: m.senderType || 'human' });   // room message → reply to room only
       }
       if (++n % 10 === 0) await post('/heartbeat', { agentSessionId: sessionId });
     } catch (e) { console.error('poll error:', e.message); await new Promise((r) => setTimeout(r, 2000)); }

@@ -117,7 +117,7 @@ const TURN_TIMEOUT = Symbol('turn-timeout');
 //   adapterPid  → the adapter process-GROUP pgid (or null in test mode)
 // Test seam: pass `_agentApp` (an in-process acp.agent({...}) AgentApp) to drive
 // the real engine without a subprocess.
-export function createEngine({ agent, cwd, permission = 'approve-all', log = console.log, turnTimeoutMs = TURN_TIMEOUT_MS, resumeSessionId = null, _agentApp = null } = {}) {
+export function createEngine({ agent, cwd, permission = 'approve-all', log = console.log, turnTimeoutMs = TURN_TIMEOUT_MS, resumeSessionId = null, onElicitation = null, _agentApp = null } = {}) {
   let child = null;
   let source;
   if (_agentApp) {
@@ -147,12 +147,21 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
   const shutdownP = new Promise((r) => { shutdownResolve = r; });
   const mapUsage = makeUsageMapper();
 
-  const app = acp.client({ name: 'concord' })
+  let app = acp.client({ name: 'concord' })
     .onRequest(acp.methods.client.session.requestPermission, (ctx) => decidePermission(ctx.params, permission));
+  // Agent-initiated questions (AskUserQuestion / MCP elicitation) — only wired
+  // when the caller can actually route them to a human. Errors → cancel, so a
+  // broken handler can never wedge the agent's turn.
+  if (onElicitation) {
+    app = app.onRequest(acp.methods.client.elicitation.create, async (ctx) => {
+      try { return (await onElicitation(ctx.params)) || { action: 'cancel' }; }
+      catch (e) { log('elicitation handler error: ' + (e?.message || e)); return { action: 'cancel' }; }
+    });
+  }
 
   let resumed = false;
   app.connectWith(source, async (ctx) => {
-    await ctx.request(acp.methods.agent.initialize, { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+    await ctx.request(acp.methods.agent.initialize, { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: onElicitation ? { elicitation: { form: {} } } : {} });
     if (resumeSessionId) {
       try {
         const resp = await ctx.request(acp.methods.agent.session.resume, { sessionId: resumeSessionId, cwd });

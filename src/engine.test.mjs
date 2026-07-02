@@ -132,6 +132,46 @@ test('resume: falls back to a fresh session when the agent cannot resume', async
   await engine.shutdown();
 });
 
+// ---- elicitation (agent asks, client answers) ----
+test('elicitation: agent question round-trips through onElicitation; capability advertised', async () => {
+  const captured = {};
+  const agent = acp.agent({ name: 'asker' })
+    .onRequest('initialize', (ctx) => { captured.caps = ctx.params.clientCapabilities; return { protocolVersion: acp.PROTOCOL_VERSION, agentCapabilities: {} }; })
+    .onRequest('session/new', () => ({ sessionId: 's-elicit' }))
+    .onRequest('session/prompt', async (ctx) => {
+      captured.answer = await ctx.client.request('elicitation/create', {
+        sessionId: ctx.params.sessionId, mode: 'form', message: 'Pick one',
+        requestedSchema: { type: 'object', properties: { question_0: { type: 'string', oneOf: [{ const: 'A', title: 'A' }, { const: 'B', title: 'B' }] } } },
+      });
+      return { stopReason: 'end_turn', usage: {} };
+    });
+  const engine = createEngine({
+    agent: 'claude', cwd: '/tmp', log: () => {}, _agentApp: agent,
+    onElicitation: async (params) => { captured.asked = params.message; return { action: 'accept', content: { question_0: 'B' } }; },
+  });
+  await engine.runTurn('go');
+  assert.deepEqual(captured.caps.elicitation, { form: {} });        // capability advertised only because a handler exists (SDK pads the other defaults)
+  assert.equal(captured.asked, 'Pick one');
+  assert.deepEqual(captured.answer, { action: 'accept', content: { question_0: 'B' } });
+  await engine.shutdown();
+});
+
+test('elicitation: a throwing handler cancels instead of wedging the turn', async () => {
+  const captured = {};
+  const agent = acp.agent({ name: 'asker2' })
+    .onRequest('initialize', () => ({ protocolVersion: acp.PROTOCOL_VERSION, agentCapabilities: {} }))
+    .onRequest('session/new', () => ({ sessionId: 's-e2' }))
+    .onRequest('session/prompt', async (ctx) => {
+      captured.answer = await ctx.client.request('elicitation/create', { sessionId: ctx.params.sessionId, mode: 'form', message: 'x', requestedSchema: { type: 'object', properties: {} } });
+      return { stopReason: 'end_turn', usage: {} };
+    });
+  const engine = createEngine({ agent: 'claude', cwd: '/tmp', log: () => {}, _agentApp: agent, onElicitation: async () => { throw new Error('boom'); } });
+  const { stopReason } = await engine.runTurn('go');
+  assert.deepEqual(captured.answer, { action: 'cancel' });
+  assert.equal(stopReason, 'end_turn');                             // turn completed despite the broken handler
+  await engine.shutdown();
+});
+
 // --- usage mapper (per-turn vs cumulative; absent) ---
 test('makeUsageMapper: per-turn takes each turn as-is', () => {
   const map = makeUsageMapper('per-turn');

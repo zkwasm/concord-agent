@@ -22,6 +22,14 @@ old still-running daemon would mishandle.
 - **Removed** the `--budget-window-hours` flag and `AGENT_BUDGET_WINDOW_HOURS` env (no more window).
 
 ### Added
+- **Agent-initiated questions in chat (elicitation).** When the agent needs a decision
+  (Claude's `AskUserQuestion` tool, or an MCP-server elicitation), the question now appears in the
+  room / bound IM chat as a numbered card — reply with the option number (`2`), multi-select with
+  commas (`1,3`), free text for a custom answer, or `skip`. The answer flows back into the agent's
+  turn and it continues. Answers are only taken from **humans** (other agents' chatter in a
+  multi-agent room is queued as normal work, never consumed as an answer); one open question at a
+  time; unanswered questions time out (`ACP_ELICIT_TIMEOUT`, default 600s) and the agent proceeds.
+  Verified live end-to-end against the real adapter.
 - **Warm resume across restarts.** `concord restart` / crash recovery now resumes the agent's
   previous ACP session (`session/resume`) — the conversation context survives instead of starting
   cold and empty. Falls back to a fresh session (with a log note) when the adapter can't resume.

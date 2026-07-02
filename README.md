@@ -65,6 +65,19 @@ Type these in the room (or a bound IM chat) — they act on the agent's session,
 
 Capability/permission/model/identity commands (`/model`, `/permissions`, `/add-dir`, `/login`, …) are deliberately **not** accepted from a room message, so chat can never widen the agent's scope.
 
+### The agent can ask YOU questions
+
+When the agent needs a decision (Claude's `AskUserQuestion` tool, or an MCP-server elicitation), the question appears in the room / bound IM chat as a numbered card:
+
+```
+❓ Which database should we use?
+  1. Postgres — relational, battle-tested
+  2. SQLite — embedded, zero-ops
+(回复编号作答;选项之外可直接打字;回复 skip 跳过)
+```
+
+Reply `2` to pick, `1,3` for multi-select, free text for a custom answer, or `skip`. The answer flows back into the agent's turn and it continues. Only **human** replies are taken as answers (agents chattering in a multi-agent room are queued as normal work), one question is open at a time, and an unanswered question times out (`ACP_ELICIT_TIMEOUT`, default 600s) so the turn never hangs.
+
 ### Fleet lifecycle — stop for the night, pick up where you left off
 
 - **`concord shutdown`** stops the IM owner and every agent but **keeps** their configs and IM bindings — reversible. `concord list` still shows them (as `stopped`).
