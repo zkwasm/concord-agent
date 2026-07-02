@@ -5,6 +5,11 @@ All notable changes to `concord-agent`. Dates are UTC.
 ## 0.7.2 — 2026-07-02 (unreleased)
 
 ### Fixed
+- **CLI id and room name now line up.** When the agent's name is taken in a room, the
+  fallback name now uses the host id's hex tail — `claude-a1b2c3` in `concord list` is
+  `claude-a1b2c3` in the room roster — instead of an unrelated pid-derived decimal
+  (`claude-6016`). Stable across restarts, so a restarting host stops minting a new
+  ghost identity each time (a pid-based name remains as a last-resort candidate).
 - **80%-of-budget warning re-posted after every restart.** The one-time flag was in-memory,
   so a crash-looping host would spam the warning into the room on each incarnation. It is now
   persisted with the usage meter and cleared only by `concord budget --reset`.

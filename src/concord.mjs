@@ -126,7 +126,10 @@ function spawnDaemon(id, f, { fg }) {
   // host (incl. --bind) → progress ON so the IM chat sees the agent working, not just the
   // final reply; join (web/multi-agent) → OFF. A bound host posts progress to the ROOM and
   // the `concord im` owner relays it on (im=null here — the owner owns the single bot conn).
-  const env = { ...process.env, STORE_PATH: reg.statePath(id), ACP_PROGRESS: f.mode === 'host' ? '1' : '0', ACP_IM: f.im || '' };
+  // CONCORD_HOST_ID: lets the bridge derive its 409-fallback room name from the SAME
+  // suffix `concord list` shows (claude-a1b2c3), so the CLI id and the room roster
+  // name line up instead of two unrelated numbers.
+  const env = { ...process.env, STORE_PATH: reg.statePath(id), CONCORD_HOST_ID: id, ACP_PROGRESS: f.mode === 'host' ? '1' : '0', ACP_IM: f.im || '' };
   const supArgs = buildSupArgs(f);
   if (fg) {
     reg.register({ id, ...f });

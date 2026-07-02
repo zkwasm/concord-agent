@@ -100,7 +100,14 @@ async function joinRoom() {
     if (res.ok) { senderName = storedSender; sessionId = (await res.json()).agentSessionId; store.setSessionId(CONCORD_ROOM_ID, sessionId); store.setSender(CONCORD_ROOM_ID, senderName); console.log(`✓ Concord: resumed room as "${senderName}"`); return; }
     store.setSessionId(CONCORD_ROOM_ID, null); // stale resume token → fresh join
   }
-  for (const name of [AGENT_NAME, `${AGENT_NAME}-${process.pid % 10000}`]) {
+  // Fallback suffix when AGENT_NAME is taken: the host id's hex tail (what
+  // `concord list` shows — "claude-a1b2c3" there is "claude-a1b2c3" in the room),
+  // so the two names line up. Bare runs without a host id keep the pid fallback.
+  const suffix = (process.env.CONCORD_HOST_ID || '').split('-').pop() || String(process.pid % 10000);
+  // Last-resort pid candidate: if the stable name is ALSO held by a stale session
+  // (state.json lost), a fresh unique name still gets us into the room.
+  const candidates = [...new Set([AGENT_NAME, `${AGENT_NAME}-${suffix}`, `${AGENT_NAME}-${process.pid % 10000}`])];
+  for (const name of candidates) {
     const res = await post('/join', { sender: name });
     if (res.ok) { senderName = name; sessionId = (await res.json()).agentSessionId; store.setSessionId(CONCORD_ROOM_ID, sessionId); store.setSender(CONCORD_ROOM_ID, name); console.log(`✓ Concord: joined room as "${name}"`); return; }
     if (res.status !== 409) die(`join failed: ${res.status} ${await res.text()}`);
