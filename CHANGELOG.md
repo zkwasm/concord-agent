@@ -2,7 +2,7 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
-## 0.7.1 — 2026-07-02 (unreleased)
+## 0.7.1 — 2026-07-02
 
 Drop-in upgrade; restart running hosts (`concord shutdown && concord up`) to pick it up.
 
