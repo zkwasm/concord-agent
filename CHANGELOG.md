@@ -2,7 +2,7 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
-## 0.7.2 — 2026-07-02 (unreleased)
+## 0.7.2 — 2026-07-02
 
 ### Added
 - **Join-time naming: a one-off headless agent proposes role-style names.** In a
