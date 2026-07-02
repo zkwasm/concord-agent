@@ -22,6 +22,7 @@ import { obtainRoomId } from './handoff.mjs';
 import { saveCreds, removeCreds, loadCreds, getCreds } from './creds.mjs';
 import { openBindings } from './im-bindings.mjs';
 import { fetchRoomName } from './room-meta.mjs';
+import { suggestNames } from './naming.mjs';
 import { ownerAction } from './owner-lifecycle.mjs';
 import { overallHeadline, bindingVerdict, bindingNextAction } from './im-health.mjs';
 
@@ -80,6 +81,32 @@ function confirm(question) {
     rl.question(`${question} [y/N] `, (a) => { rl.close(); resolve(/^y(es)?$/i.test(a.trim())); });
   });
 }
+
+function ask(question) {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (a) => { rl.close(); resolve(a.trim()); });
+  });
+}
+
+// Interactive naming at join time (TTY only; --as / --name / AGENT_NAME skip it).
+// A readable name is how humans in a multi-agent room decide who to @ and who
+// gets which task — so a ONE-OFF headless agent (not the hosted one) reads the
+// project dir + room purpose + who's already present and proposes role-style
+// candidates; the human picks a number, types a free-form name, or hits Enter
+// for the first suggestion. Asked ONCE per host — restarts / `concord up` reuse
+// the persisted name and never re-ask.
+async function pickAgentName({ dir, agentType, url, room }) {
+  const { candidates } = await suggestNames({ dir, agentType, url, roomId: room, log: console.log });
+  if (!candidates.length) return null;
+  console.log('  给这个 agent 起个名字(它在房间里负责什么?):');
+  candidates.forEach((c, i) => console.log(`    ${i + 1}. ${c}${i === 0 ? '   (回车默认)' : ''}`));
+  const a = await ask('  name> ');
+  if (!a) return candidates[0];
+  const n = parseInt(a, 10);
+  if (Number.isInteger(n) && n >= 1 && n <= candidates.length && String(n) === a) return candidates[n - 1];
+  return a.replace(/\s+/g, '-').slice(0, 24);
+}
 const shortRoom = (r) => (r ? r.slice(0, 8) : '-');
 // Display width: CJK / fullwidth glyphs take two terminal columns, so the list table
 // pads by width (not string length) — otherwise a room named 「设计评审」 skews the row.
@@ -129,7 +156,7 @@ function spawnDaemon(id, f, { fg }) {
   // CONCORD_HOST_ID: lets the bridge derive its 409-fallback room name from the SAME
   // suffix `concord list` shows (claude-a1b2c3), so the CLI id and the room roster
   // name line up instead of two unrelated numbers.
-  const env = { ...process.env, STORE_PATH: reg.statePath(id), CONCORD_HOST_ID: id, ACP_PROGRESS: f.mode === 'host' ? '1' : '0', ACP_IM: f.im || '' };
+  const env = { ...process.env, STORE_PATH: reg.statePath(id), CONCORD_HOST_ID: id, ...(f.name ? { AGENT_NAME: f.name } : {}), ACP_PROGRESS: f.mode === 'host' ? '1' : '0', ACP_IM: f.im || '' };
   const supArgs = buildSupArgs(f);
   if (fg) {
     reg.register({ id, ...f });
@@ -230,10 +257,19 @@ async function startHost(mode, args) {
   // `concord list`/`status` can show it with zero network. Best-effort: '' on failure,
   // and list/status fall back to the short room id.
   const roomName = await fetchRoomName(cfg.url, room);
+  // Room display name: explicit --as/--name wins; otherwise, with a human at the
+  // terminal, run the one-off headless naming flow. Non-TTY (scripts, revive)
+  // keeps the plain agent default — never blocks.
+  let name = cfg.label || (cfg.name && cfg.name !== cfg.agent ? cfg.name : null);
+  if (!name && process.stdin.isTTY && process.stdout.isTTY) {
+    try { name = await pickAgentName({ dir: cwd, agentType: cfg.agent, url: cfg.url, room }); }
+    catch { /* naming is a nicety — never block the start */ }
+    if (name) console.log(`  ✓ 将以「${name}」加入房间`);
+  }
   const f = {
     agent: cfg.agent, mode, room, cwd, url: cfg.url, im, bound,
     ...(roomName ? { roomName } : {}),
-    ...(cfg.label ? { label: cfg.label } : {}),
+    ...(name ? { name, label: cfg.label || name } : {}),
     budget: cfg.budget || null,
   };
   const pid = spawnDaemon(id, f, { fg });
@@ -246,7 +282,7 @@ function listHosts() {
   // One formatter for header AND rows so the (now wider) ROOM column stays aligned. The IM
   // column (last) answers "which chat/bot is this agent hooked to" in one glance (Tom's ask).
   const row = (c) => `${padCol(c[0], 18)} ${padCol(c[1], 8)} ${padCol(c[2], 5)} ${padCol(c[3], 20)} ${padCol(c[4], 9)} ${padCol(c[5], 7)} ${padCol(c[6], 6)} ${padCol(c[7], 6)} ${c[8]}`;
-  console.log(row(['ID', 'AGENT', 'MODE', 'ROOM', 'STATUS', 'PID', 'UP', 'TOK', 'IM']));
+  console.log(row(['NAME', 'AGENT', 'MODE', 'ROOM', 'STATUS', 'PID', 'UP', 'TOK', 'IM']));
   // Reverse index room → binding once, so each row shows its bound chat without re-scanning.
   const bindByRoom = {};
   for (const b of Object.values(openBindings().list())) bindByRoom[b.roomId] = b;
@@ -259,7 +295,10 @@ function listHosts() {
     const tok = u ? String(u.fresh ?? 0) : '-';   // fresh tokens this window — a burner stands out at a glance
     const bd = bindByRoom[h.room];
     const im = bd ? `${bd.platform}·${chatLabel(bd)}` : '-';
-    console.log(row([truncWidth(h.label || h.id, 18), h.agent || '', h.mode || '', roomLabel(h), status, String(h.pid || '-'), h.started ? ago(h.started) : '-', tok, im]));
+    // NAME = the agent's actual in-room sender (what the roster shows), falling back
+    // to the local label/id for hosts that haven't joined yet. `stop`/`status` still
+    // accept label or id-prefix regardless of what's displayed.
+    console.log(row([truncWidth(readSender(h.id, h.room) || h.label || h.id, 18), h.agent || '', h.mode || '', roomLabel(h), status, String(h.pid || '-'), h.started ? ago(h.started) : '-', tok, im]));
   }
 }
 
@@ -283,6 +322,8 @@ function statusHost(id) {
   } else if (!h.stopped && rt.exit) {
     lines.push(`exit    ${rt.exit.reason} · ${ago(rt.exit.at)} ago`);
   }
+  const sname = readSender(h.id, h.room);
+  if (sname) lines.push(`name    ${sname}   (in-room sender — what the roster shows)`);
   lines.push(`room    ${h.roomName ? `${h.roomName}  ·  ${h.room}` : h.room}`);
   // The IM chat bound to this room (reverse lookup), so CLI and IM agree on what this host is.
   const binding = Object.values(openBindings().list()).find((b) => b.roomId === h.room);
@@ -383,6 +424,11 @@ function readUsage(id, room) {
 // Live context-window usage (from ACP usage_update), written by the bridge.
 function readContext(id, room) {
   try { return JSON.parse(readFileSync(reg.statePath(id), 'utf8')).rooms?.[room]?.context ?? null; } catch { return null; }
+}
+// The agent's ACTUAL in-room sender name (persisted by the bridge on join/resume).
+// Shown by list/status so the CLI and the room roster agree on what this agent is called.
+function readSender(id, room) {
+  try { return JSON.parse(readFileSync(reg.statePath(id), 'utf8')).rooms?.[room]?.sender ?? null; } catch { return null; }
 }
 // Live runtime a host writes into its own state.json (activity / paused / exit), so
 // `list`/`status` can show what it's DOING and WHY it stopped — not just pid-liveness.

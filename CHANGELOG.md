@@ -4,7 +4,21 @@ All notable changes to `concord-agent`. Dates are UTC.
 
 ## 0.7.2 — 2026-07-02 (unreleased)
 
+### Added
+- **Join-time naming: a one-off headless agent proposes role-style names.** In a
+  multi-agent room the name is how humans decide who to @ and who gets which task, so
+  `concord join`/`host` (TTY, no `--as`/`--name`) now gathers the project dir + the room's
+  name/purpose + who is already present, runs a ONE-OFF `claude -p` call (separate from the
+  hosted agent), and offers the candidates — pick a number, type a free-form name (e.g.
+  "评审"), or hit Enter for the first. Asked once per host; restarts / `concord up` reuse
+  the persisted name. Headless call unavailable → falls back to dir-name candidates;
+  non-TTY runs never prompt.
+
 ### Fixed
+- **`concord list`/`status` now show the agent's ACTUAL in-room name.** The first column
+  (now `NAME`) reads the persisted room sender, so whatever the roster shows is exactly what
+  the CLI shows — in every case, not just the fallback one. `status` adds a `name` line.
+  Lifecycle commands still accept the label or an id-prefix.
 - **CLI id and room name now line up.** When the agent's name is taken in a room, the
   fallback name now uses the host id's hex tail — `claude-a1b2c3` in `concord list` is
   `claude-a1b2c3` in the room roster — instead of an unrelated pid-derived decimal
