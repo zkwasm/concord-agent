@@ -4,6 +4,15 @@ All notable changes to `concord-agent`. Dates are UTC.
 
 ## 0.7.4 — 2026-07-02 (unreleased)
 
+### Changed
+- **Long tasks are no longer punished.** The "3 timeouts in 6h → auto-pause" fuse is
+  removed (it turned normal long-running work into an unrecoverable-feeling `paused`
+  state), and the per-turn wall-clock ceiling default is raised **1800s → 21600s (6h)**.
+  The ceiling is now purely a liveness guard against a wedged adapter: on timeout the
+  turn is cancelled (burn stops), the room is told, and the next message retries.
+  `ACP_TURN_TIMEOUT=0` disables it entirely. `concord resume` remains only to clear a
+  stale pause record left by an older daemon.
+
 ### Fixed
 - **Hosted agent no longer suggests `/concord:resume` / plugin commands.** A Claude that
   also has the concord PLUGIN installed saw room-style messages, concluded it never

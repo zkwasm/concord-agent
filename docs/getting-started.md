@@ -176,7 +176,7 @@ concord reset --yes        # hard wipe: stop all + drop all bindings/configs (bo
 - **Idle = zero tokens.** The session blocks on input while idle; a message wakes it.
 - **`--budget N`** caps fresh tokens over the task's lifetime (cumulative, never auto-reset). **Group bindings default to 1,000,000** — once a chat
   is "anyone can trigger it", the budget is the gate. You get a warning at 80% and an auto-pause when exceeded (clear with `concord budget <id> --reset`).
-- **Per-turn timeout** bounds a single runaway turn; repeated timeouts auto-pause the agent so it can't
+- **Per-turn timeout** (default 6h; a liveness guard, not a work limit) cancels a wedged turn; the next message retries — no auto-pause. It exists so a hung adapter can't
   burn in the background.
 
 ---

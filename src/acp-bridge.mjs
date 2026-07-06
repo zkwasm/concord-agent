@@ -192,10 +192,12 @@ let usageWarned = false;
 let recreateTimes = [];               // timestamps of recent engine recreates (crash-loop guard)
 const RECREATE_WINDOW_MS = 5 * 60 * 1000;
 const RECREATE_MAX = 5;               // max engine recreates per window before we pause
-let timeoutTimes = [];                // timestamps of recent turn-timeouts. A WINDOW (not a consecutive
-const TIMEOUT_WINDOW_MS = 6 * 60 * 60 * 1000;   // count) so an alternating timeout/clean pattern can't launder
-const MAX_TIMEOUTS_WINDOW = 3;        // the streak: each timed-out turn burns ~ACP_TURN_TIMEOUT off-budget.
-let paused = false;                   // hard pause (repeated timeouts) — `concord resume` / restart clears
+// NOTE: the old "3 timeouts in 6h → auto-pause" fuse is GONE — long tasks are
+// normal, and the fuse turned them into an unrecoverable-feeling pause loop.
+// A timed-out turn is simply cancelled (the adapter group is killed, so the
+// burn stops) and the room is told; the next message retries. The per-turn
+// wall-clock ceiling itself stays (ACP_TURN_TIMEOUT, default 21600s = 6h;
+// 0 disables) — it is a liveness guard against a wedged adapter, not a work limit.
 
 // (Re)create the resident ACP engine: spawn the adapter, wait until the session is
 // live, and record the adapter's process-group pgid so the CLI can reap it even if
@@ -363,11 +365,10 @@ function maybeBudgetWarn() {
 }
 
 async function drain() {
-  if (busy || paused || pending.length === 0) return;
+  if (busy || pending.length === 0) return;
   busy = true;
   try {
     while (pending.length) {
-      if (paused) { pending.length = 0; break; }
       const item = pending[0];                                 // peek: reply/notes target THIS message's IM chat
       if (budgetBlocked()) { await budgetNote(item.imChat); pending.length = 0; break; } // drop queued; over budget
       // Self-heal: a dead engine (adapter crash / dropped connection) is rebuilt
@@ -396,19 +397,7 @@ async function drain() {
         // Surface it and keep the bridge alive; the next iteration rebuilds the engine.
         console.error('turn failed:', e.message);
         if (e && e.code === 'TURN_TIMEOUT') {
-          // A timed-out turn isn't budget-billed (it never reached 'stop'), so the
-          // per-amount cap can't catch a slow-but-burning prompt. Bound it by a WINDOW
-          // count (not consecutive — an alternating timeout/clean pattern must still
-          // converge to a pause; a clean turn does NOT launder a timeout's burn).
-          const now = Date.now();
-          timeoutTimes = timeoutTimes.filter((t) => now - t < TIMEOUT_WINDOW_MS);
-          timeoutTimes.push(now);
-          if (timeoutTimes.length >= MAX_TIMEOUTS_WINDOW) {
-            paused = true; pending.length = 0; store.setPaused('timeouts');   // persist so `concord list` shows PAUSED, not a silently-dropping "running"
-            await out(`⏸️ 多次超时(${MAX_TIMEOUTS_WINDOW} 次),已暂停以免持续烧 token。用 \`concord list\` 找到 id 后 \`concord resume <id>\` 或 \`concord restart <id>\`。`).catch(() => {});
-            break;
-          }
-          await out(`⚠️ 这轮超时被取消了(${String(e.message).slice(0, 100)})。任务太大就拆小一点再发。`).catch(() => {});
+          await out(`⚠️ 这轮超过 ${Math.round((parseInt(process.env.ACP_TURN_TIMEOUT ?? '21600', 10) || 21600) / 3600)} 小时仍未结束,被当作卡死取消了。可以再发一次继续;要放宽就用 ACP_TURN_TIMEOUT 调大(0 = 不限)。`).catch(() => {});
         } else {
           await out(`⚠️ 这条没处理成功(${String(e.message).slice(0, 120)}),可以再发一次。`).catch(() => {});
         }
@@ -418,7 +407,7 @@ async function drain() {
     }
   } finally {
     busy = false;   // ALWAYS reset, so a failure can't wedge the host busy forever
-    if (!paused) store.setActivity('idle');   // queue drained → idle (a pause is surfaced separately)
+    store.setActivity('idle');   // queue drained → idle
   }
 }
 
@@ -480,7 +469,6 @@ async function handleInbound({ text, sender, imChat = null, senderType = 'human'
     settleElicit(r.response);
     return;
   }
-  if (paused) { if (im && imChat) im.send(imChat, '⏸️ 已暂停(多次超时);让 owner 跑 `concord resume`/`restart` 后再发。').catch(() => {}); return; }
   if (budgetBlocked()) { await budgetNote(imChat); return; }   // over budget → refuse cleanly
   // Self-intro + ack ONLY when this agent owns its own IM bridge (`--im`). In `--bind` mode the
   // `concord im` owner is the user-facing acker ("🤖 Claude 正在处理…"), so a second ack here
@@ -543,7 +531,9 @@ process.on('uncaughtException', (e) => { try { store.setExit('uncaught: ' + (e?.
 // meter. `concord budget --reset` (SIGUSR2) is the ONLY thing that zeroes the
 // lifetime token counter — the daemon owns the in-memory usage, so a file edit
 // wouldn't be seen. Kept separate so resuming never silently wipes the meter.
-process.on('SIGUSR1', () => { paused = false; timeoutTimes = []; store.setPaused(null); store.setActivity('idle'); console.log('SIGUSR1 → unpaused; accepting tasks again'); });
+// SIGUSR1 (`concord resume`): nothing auto-pauses anymore, but clear any stale
+// pause record left by an older daemon so list/status stop showing "paused".
+process.on('SIGUSR1', () => { store.setPaused(null); store.setActivity('idle'); console.log('SIGUSR1 → cleared any stale pause record'); });
 process.on('SIGUSR2', () => { store.resetUsage(CONCORD_ROOM_ID); store.setActivity('idle'); console.log('SIGUSR2 → token usage counter reset'); });
 
 await joinRoom();

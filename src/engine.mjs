@@ -101,11 +101,12 @@ export function makeUsageMapper(mode = process.env.ACP_USAGE_MODE || 'per-turn')
 // the WITHIN-turn backstop so a single degenerate/looping turn — or an adapter that
 // never emits 'stop' — can't burn unbounded. On timeout the turn is cancelled AND
 // the adapter group is killed (the LLM process dies → burn stops immediately); the
-// bridge then recreates a fresh engine. Default 1800s is generous (normal coding
-// turns finish well under it → no UX impact); ACP_TURN_TIMEOUT=0 disables it.
+// bridge then recreates a fresh engine. Default 21600s (6h): long agent tasks are
+// NORMAL — this is a liveness guard against a wedged adapter, not a work limit.
+// ACP_TURN_TIMEOUT=0 disables it entirely.
 const TURN_TIMEOUT_MS = (() => {
-  const raw = parseInt(process.env.ACP_TURN_TIMEOUT ?? '1800', 10);
-  return (Number.isFinite(raw) && raw >= 0 ? raw : 1800) * 1000;
+  const raw = parseInt(process.env.ACP_TURN_TIMEOUT ?? '21600', 10);
+  return (Number.isFinite(raw) && raw >= 0 ? raw : 21600) * 1000;
 })();
 const TURN_TIMEOUT = Symbol('turn-timeout');
 
