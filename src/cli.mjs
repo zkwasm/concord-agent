@@ -70,13 +70,35 @@ export function resolveConfig(argv, env = {}) {
   };
 }
 
-// Should a polled room message wake the agent? Own messages are echoes; 'system'
-// messages are ambient notifications (file-upload notices etc.) — feeding those to
-// the LLM burns a turn AND produces "no action needed" chatter back into the room,
-// wasting every other participant's tokens. Humans and other agents wake it.
+// Wake economics: DELIVERY (the agent's context must contain every room message,
+// in order) is nearly free via the batched inbox; a WAKE (an LLM turn) is the
+// expensive part and must signal addressed intent. Classification:
+//   'skip'  — own echoes (already in its context)
+//   'wake'  — @-mentions me (anyone), or a human message with no @ at all
+//   'defer' — everything else: agents' un-mentioned chatter/status posts,
+//             messages @-ing others, system notices. Delivered later as one
+//             batched context block (or by the timed inbox flush), never a
+//             per-message turn — so N agents can't bill each other for small talk.
+// Mentions come server-resolved (m.mentions); a text-scan fallback covers relays
+// that don't carry the field.
+export function classifyInbound(m, selfName) {
+  if (!m) return 'skip';
+  if (m.sender === selfName) return 'skip';
+  if (m.senderType === 'system' || m.sender === 'system') return 'defer';
+  const self = String(selfName || '').trim().toLowerCase();
+  const mentions = Array.isArray(m.mentions) ? m.mentions : null;
+  if (mentions) {
+    if (mentions.some((x) => String(x).trim().toLowerCase() === self)) return 'wake';
+    if (mentions.length) return 'defer';                      // addressed to someone else
+  } else {
+    const content = String(m.content || '');
+    if (selfName && content.includes(`@${selfName}`)) return 'wake';
+    if (/(^|\s)@\S{1,32}/.test(content)) return 'defer';      // @-ing someone that isn't me
+  }
+  return m.senderType === 'human' ? 'wake' : 'defer';         // bare broadcast: humans wake everyone; agent status posts don't
+}
+
+// Back-compat shim (0.7.3 name): anything not 'skip' used to relay.
 export function shouldRelayInbound(m, selfName) {
-  if (!m) return false;
-  if (m.sender === selfName) return false;
-  if (m.senderType === 'system' || m.sender === 'system') return false;
-  return true;
+  return classifyInbound(m, selfName) !== 'skip';
 }

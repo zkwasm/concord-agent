@@ -15,7 +15,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openStore } from './store.mjs';
 import { toolToProgress, toolDetail } from './render.mjs';
-import { resolveConfig, usage, shouldRelayInbound } from './cli.mjs';
+import { resolveConfig, usage, classifyInbound } from './cli.mjs';
 import { overBudget, usageReport, budgetExceededNote } from './budget.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { createEngine } from './engine.mjs';
@@ -295,7 +295,9 @@ const briefing = () =>
   `[concord-agent bridge] You are ALREADY connected to Concord room ${CONCORD_ROOM_ID} as "${senderName}". ` +
   `This bridge relays room messages to you as "[sender] text" and posts your replies back to the room automatically. ` +
   `Do NOT run or suggest any /concord:* plugin commands (join/resume/stop) and do NOT read or write .concord/ state — the bridge owns all room I/O. ` +
-  `Just do the work and reply normally.`;
+  `Room protocol: (1) You are only woken by messages that @-mention "${senderName}", by humans, or by a periodic batch of the room chatter you missed — nothing is ever lost. ` +
+  `(2) To make ANOTHER agent act, you MUST @-mention its exact name; un-mentioned posts are ambient status that wakes no one. ` +
+  `(3) If a message needs no action or reply from you (courtesy chatter, someone else's task, a batch with nothing for you), reply with exactly NOOP — it will not be posted. NEVER post "standing by"/"待命中" filler.`;
 
 async function runTurn(text) {
   if (!briefed) { briefed = true; text = `${briefing()}\n\n${text}`; }
@@ -342,7 +344,42 @@ async function runTurn(text) {
     out(w);   // safety-relevant fact → room + IM, regardless of PROGRESS (like turn-fail notes)
   }
   console.log(`■ turn end  ·  stop=${stopReason}  ·  fresh ${usage.fresh} tok, cache-read ${usage.cached} tok`);
-  return { reply, usage };
+  return { reply, usage, tools: toolState.size };
+}
+
+// ── Deferred-message inbox ──────────────────────────────────────────────────
+// Un-addressed chatter never wakes the agent per-message; it lands in the inbox
+// and is flushed as ONE batched context block on the next natural wake — or, so
+// a room where everyone only broadcasts can't fall silent forever, by a timed
+// digest wake (ACP_INBOX_FLUSH seconds, default 600; 0 disables the timer).
+const INBOX_FLUSH_MS = (() => { const raw = parseInt(process.env.ACP_INBOX_FLUSH ?? '600', 10); return (Number.isFinite(raw) && raw >= 0 ? raw : 600) * 1000; })();
+let inboxTimer = null;
+
+function deferInbound(sender, content) {
+  store.pushInbox(CONCORD_ROOM_ID, sender, content);
+  console.log(`· deferred | ${sender}: ${String(content).slice(0, 60)}`);
+  if (!INBOX_FLUSH_MS || inboxTimer) return;
+  inboxTimer = setTimeout(() => {
+    inboxTimer = null;
+    if (!store.getInbox(CONCORD_ROOM_ID).length) return;   // already flushed by a natural wake
+    pending.push({ digest: true, imChat: null });
+    drain();
+  }, INBOX_FLUSH_MS);
+}
+
+// A turn's input = the batched inbox (if any) + the triggering message. The
+// digest wake carries only the batch, with an explicit "act or NOOP" framing.
+function composeTurn(item) {
+  const inbox = store.getInbox(CONCORD_ROOM_ID);
+  let head = '';
+  if (inbox.length) {
+    const dropped = store.getInboxDropped(CONCORD_ROOM_ID);
+    head = `(以下 ${inbox.length} 条是你未被唤醒期间的房间消息,按时间顺序,仅供同步上下文,无需逐条回应${dropped ? `;更早 ${dropped} 条已省略` : ''}:)\n`
+      + inbox.map((x) => `[${x.sender}] ${x.content}`).join('\n') + '\n\n';
+    store.clearInbox(CONCORD_ROOM_ID);
+  }
+  if (item.digest) return head + '(以上为批量同步。其中若有需要你行动或回应的内容就处理;没有就只回 NOOP。)';
+  return head + item.text;
 }
 
 // Whether the lifetime fresh-token cap is hit — so a runaway agent can't burn
@@ -380,18 +417,23 @@ async function drain() {
       }
       pending.shift();
       currentImChat = item.imChat;                             // route this turn's progress + reply to its IM chat (if any)
-      console.log(`\n▶ turn start  ·  ${item.text.slice(0, 80)}`);
-      store.setActivity('working', item.text.replace(/^\[[^\]]*\]\s*/, '').slice(0, 60));   // surface to `concord list`/`status`
+      const label = item.digest ? '(inbox digest)' : item.text;
+      console.log(`\n▶ turn start  ·  ${label.slice(0, 80)}`);
+      store.setActivity('working', label.replace(/^\[[^\]]*\]\s*/, '').slice(0, 60));   // surface to `concord list`/`status`
       try {
-        const { reply, usage } = await runTurn(item.text);
+        const { reply, usage, tools } = await runTurn(composeTurn(item));
         recreateTimes = [];                                    // a clean turn means the engine recovered → reset the crash-loop guard
         store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached);
         maybeBudgetWarn();                                     // surface 80%-of-budget before the cap pauses us
-        // Never go silent: a clean turn can end with no assistant text (Claude Code
-        // sometimes puts the conclusion in a post_turn_summary the ACP adapter drops).
-        // The progress cards already show the work — this just confirms the turn ended.
-        if (reply.trim()) await out(reply.trim());             // agent's full reply -> room + IM chat
-        else await out('✓ 完成');
+        // The agent has a right to SILENCE: NOOP (or an empty, tool-less turn) posts
+        // nothing — replying "待命中" to every wake is what fuels multi-agent echo
+        // loops. A turn that DID work but ended text-less still confirms with ✓
+        // (Claude Code sometimes puts the conclusion in a summary the adapter drops).
+        const txt = reply.trim();
+        if (/^[\s((]*NOOP[\s))。.!]*$/i.test(txt)) console.log('■ NOOP — nothing to say, staying silent');
+        else if (txt) await out(txt);                          // agent's full reply -> room + IM chat
+        else if (tools > 0) await out('✓ 完成');
+        else console.log('■ empty reply, no tools — staying silent');
       } catch (e) {
         // A mid-turn ACP failure must NOT crash the host (the #1 review finding).
         // Surface it and keep the bridge alive; the next iteration rebuilds the engine.
@@ -493,9 +535,11 @@ async function pollLoop() {
       const res = await fetch(`${room}/messages?session=${sessionId}&wait=30`);
       if (res.status === 401) { console.warn('Concord session expired → rejoin'); await joinRoom(); continue; }
       for (const m of (await res.json()).messages || []) {
-        if (!shouldRelayInbound(m, senderName)) continue;   // own echoes + ambient 'system' notices never wake the agent
+        const cls = classifyInbound(m, senderName);        // wake = addressed intent; defer = ambient chatter → inbox; skip = own echo
+        if (cls === 'skip') continue;
         if (store.wasProcessedInbound(m.id)) continue;   // already handled (resume / redelivery)
         store.markProcessedInbound(m.id);
+        if (cls === 'defer') { deferInbound(m.sender, m.content); continue; }
         await handleInbound({ text: m.content, sender: m.sender, imChat: null, senderType: m.senderType || 'human' });   // room message → reply to room only
       }
       if (++n % 10 === 0) await post('/heartbeat', { agentSessionId: sessionId });

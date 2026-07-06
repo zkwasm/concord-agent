@@ -2,6 +2,24 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.6 — 2026-07-05 (unreleased)
+
+### Changed
+- **Multi-agent wake economics: delivery ≠ wake.** Previously every room message woke every
+  agent for a full LLM turn, and the "never go silent" rule forced a filler reply — so N
+  idle agents billed each other for "待命中" echo loops. Now messages are classified:
+  - **wake** (a real turn): messages that @-mention this agent, and human messages with no @;
+  - **defer** (free): other agents' un-mentioned status chatter, messages @-ing someone else,
+    and system notices — they land in a persistent per-room **inbox** and are delivered as ONE
+    batched context block on the next wake, so the agent's view of the discussion stays
+    complete without per-message turns;
+  - **timed digest**: if the inbox has content and nothing wakes the agent naturally, it is
+    woken once after `ACP_INBOX_FLUSH` (default 600s; 0 disables) to absorb the batch — a room
+    where everyone only broadcasts can never fall permanently silent.
+  - **right to silence**: a turn may reply exactly `NOOP` (or end empty with no tool use) and
+    nothing is posted — the echo loop dies at its first hop. The in-session briefing teaches
+    the protocol: @-mention a peer's exact name to make it act; un-mentioned posts wake no one.
+
 ## 0.7.5 — 2026-07-05 (unreleased)
 
 ### Fixed

@@ -109,6 +109,25 @@ test('warned80: persists across reopen (no re-warn on restart); cleared by reset
   assert.equal(openStore(path).getWarned80('r'), false);
 });
 
+test('inbox: deferred messages persist, cap counts overflow, clear resets', () => {
+  const path = freshPath();
+  const s = openStore(path);
+  assert.deepEqual(s.getInbox('r'), []);
+  s.pushInbox('r', 'alice', '待命中');
+  s.pushInbox('r', 'bob', '@alice 交接');
+  const re = openStore(path);                          // survives a bridge restart
+  assert.equal(re.getInbox('r').length, 2);
+  assert.equal(re.getInbox('r')[0].sender, 'alice');
+  // soft cap: oldest dropped and counted
+  const s2 = openStore(freshPath());
+  for (let i = 0; i < 55; i++) s2.pushInbox('r', 'a', 'm' + i, 50);
+  assert.equal(s2.getInbox('r').length, 50);
+  assert.equal(s2.getInboxDropped('r'), 5);
+  assert.equal(s2.getInbox('r')[0].content, 'm5');     // oldest evicted first
+  s2.clearInbox('r');
+  assert.deepEqual([s2.getInbox('r').length, s2.getInboxDropped('r')], [0, 0]);
+});
+
 test('context usage: live window meter round-trips', () => {
   const path = freshPath();
   const s = openStore(path);

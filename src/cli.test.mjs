@@ -51,14 +51,28 @@ test('resolveConfig: --name and --public-url honored', () => {
   assert.equal(cfg.publicUrl, 'https://x.dev');
 });
 
-test('shouldRelayInbound: humans/agents wake it; own echoes and system notices never do', async () => {
-  const { shouldRelayInbound } = await import('./cli.mjs');
-  assert.equal(shouldRelayInbound({ sender: 'Tom', senderType: 'human' }, 'claude-1698'), true);
-  assert.equal(shouldRelayInbound({ sender: '工程师', senderType: 'agent' }, 'claude-1698'), true);
-  assert.equal(shouldRelayInbound({ sender: 'claude-1698', senderType: 'agent' }, 'claude-1698'), false);  // own echo
-  assert.equal(shouldRelayInbound({ sender: 'system', senderType: 'system', content: '[FILE] claude-1698 uploaded x.zip' }, 'claude-1698'), false);  // ambient notice
-  assert.equal(shouldRelayInbound({ sender: 'system' }, 'claude-1698'), false);   // senderType missing → sender fallback
-  assert.equal(shouldRelayInbound(null, 'claude-1698'), false);
+test('classifyInbound: wake = addressed intent; defer = ambient; skip = own echo', async () => {
+  const { classifyInbound } = await import('./cli.mjs');
+  const me = '评审';
+  // skip: my own echo
+  assert.equal(classifyInbound({ sender: me, senderType: 'agent', mentions: [] }, me), 'skip');
+  assert.equal(classifyInbound(null, me), 'skip');
+  // wake: @-mentions me (agent or human), case-insensitive
+  assert.equal(classifyInbound({ sender: 'alice', senderType: 'agent', content: '@评审 看下这个', mentions: ['评审'] }, me), 'wake');
+  assert.equal(classifyInbound({ sender: 'Tom', senderType: 'human', content: '@评审 上', mentions: ['评审', 'alice'] }, me), 'wake');
+  // wake: human broadcast with no mentions
+  assert.equal(classifyInbound({ sender: 'Tom', senderType: 'human', content: '大家停一下', mentions: [] }, me), 'wake');
+  // defer: agent broadcast (status chatter) — the echo-loop killer
+  assert.equal(classifyInbound({ sender: 'alice', senderType: 'agent', content: '待命中。', mentions: [] }, me), 'defer');
+  // defer: addressed to someone else (human or agent)
+  assert.equal(classifyInbound({ sender: 'Tom', senderType: 'human', content: '@alice 你来', mentions: ['alice'] }, me), 'defer');
+  assert.equal(classifyInbound({ sender: 'bob', senderType: 'agent', content: '@alice 交接', mentions: ['alice'] }, me), 'defer');
+  // defer: system notices (context, no wake)
+  assert.equal(classifyInbound({ sender: 'system', senderType: 'system', content: '[FILE] x uploaded a.zip' }, me), 'defer');
+  // fallback without server-resolved mentions: text scan
+  assert.equal(classifyInbound({ sender: 'alice', senderType: 'agent', content: '@评审 请看' }, me), 'wake');
+  assert.equal(classifyInbound({ sender: 'Tom', senderType: 'human', content: '@alice 你来' }, me), 'defer');
+  assert.equal(classifyInbound({ sender: 'Tom', senderType: 'human', content: '直接说事' }, me), 'wake');
 });
 
 test('resolveConfig: token budget is a CLI param (flag > env > unset)', () => {

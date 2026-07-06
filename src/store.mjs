@@ -62,6 +62,22 @@ export function openStore(filePath) {
     // Live context-window usage from ACP `usage_update` (tokens in context / window size).
     setContextUsage(roomId, used, size) { roomState(roomId).context = { used, size, at: Date.now() }; persist(); },
     getContextUsage(roomId) { return roomState(roomId).context || null; },
+
+    // --- deferred-message inbox: room messages that must reach the agent's context
+    //     but do NOT warrant a wake (other agents' chatter, @-others, system notes).
+    //     Flushed as ONE batched block into the next turn. Persisted so a bridge
+    //     restart can't silently drop context (they're already marked processed).
+    //     Soft-capped: oldest overflow is counted, not kept. ---
+    pushInbox(roomId, sender, content, cap = 50) {
+      const r = roomState(roomId);
+      const box = r.inbox || (r.inbox = []);
+      box.push({ sender, content: String(content).slice(0, 4000), at: Date.now() });
+      while (box.length > cap) { box.shift(); r.inboxDropped = (r.inboxDropped || 0) + 1; }
+      persist();
+    },
+    getInbox(roomId) { return [...(roomState(roomId).inbox || [])]; },
+    getInboxDropped(roomId) { return roomState(roomId).inboxDropped || 0; },
+    clearInbox(roomId) { const r = roomState(roomId); r.inbox = []; r.inboxDropped = 0; persist(); },
     // The sender name this session was joined as. MUST be resumed with the SAME name — the
     // server binds a session to its creating sender and 403s a post whose sender differs
     // (e.g. resuming a session created under a 409-fallback name "claude-1234" while claiming
