@@ -578,8 +578,11 @@ async function upAll() {
     revived++;
   }
   // Owners: revive via the creds-aware path (re-pins to the current app), but ONLY for
-  // logged-in platforms — never resurrect an owner for creds the user has since removed.
-  for (const platform of IM_PLATFORMS.filter((p) => getCreds(p))) {
+  // platforms that are logged in AND actually route something (≥1 chat binding).
+  // Stored creds alone must not resurrect an owner — a user who logged in once for a
+  // test but never bound a chat doesn't use IM, and `up` kept spawning a useless owner.
+  const boundPlatforms = new Set(Object.values(openBindings().list()).map((b) => b.platform));
+  for (const platform of IM_PLATFORMS.filter((p) => getCreds(p) && boundPlatforms.has(p))) {
     try { const { pid, started } = await startImOwnerIfNeeded(platform); if (started) { console.log(`✓ up IM owner (${platform}) — pid ${pid}`); revived++; } else already++; }
     catch (e) { console.log(`⚠️  IM owner (${platform}) 启动失败:${e?.message || e}`); }
   }

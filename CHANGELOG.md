@@ -2,7 +2,18 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
-## 0.7.4 — 2026-07-02 (unreleased)
+## 0.7.5 — 2026-07-05 (unreleased)
+
+### Fixed
+- **Stale "paused" display after upgrading.** Nothing auto-pauses since 0.7.4, but a pause
+  record left in state.json by an older daemon was never cleared, so `concord list`/`status`
+  showed `paused` forever (the agent actually worked fine). A clean start now drops the stale
+  record, next to the crash-record cleanup. (`concord resume <id>` also clears it by hand.)
+- **`concord up` no longer resurrects an unused IM owner.** Stored login creds alone (e.g. a
+  one-time QR test) made every `up` spawn an IM owner even with zero chat bindings. The owner
+  is now revived only for platforms that are logged in AND have at least one binding.
+
+## 0.7.4 — 2026-07-02
 
 ### Changed
 - **Long tasks are no longer punished.** The "3 timeouts in 6h → auto-pause" fuse is

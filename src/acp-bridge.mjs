@@ -542,5 +542,6 @@ try { await startIm(); } catch (e) { console.warn('IM bridge failed to start (ro
 console.log(`✓ acp-bridge up. Driving "${AGENT}" over ACP in ${AGENT_CWD} (progress=${PROGRESS ? 'on' : 'off'}, permission=${PERMISSION_POLICY}${IM_PLATFORM ? `, im=${IM_PLATFORM}` : ''}).`);
 console.log(`  Idle = room long-poll + agent idle. Send a room${IM_PLATFORM ? `/IM` : ''} message to wake it.`);
 store.setExit(null);            // clean start → clear any stale crash record from a prior incarnation
+store.setPaused(null);          // nothing auto-pauses anymore — drop a stale pause record from an older daemon (it made list/status show "paused" forever)
 store.setActivity('idle');     // up and waiting for work
 pollLoop();

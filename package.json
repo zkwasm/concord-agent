@@ -1,6 +1,6 @@
 {
   "name": "concord-agent",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "description": "Host a coding agent (claude/codex/gemini/…) in a Concord room over ACP. Resident session, idle = zero tokens, token budget, IM control.",
   "type": "module",
   "bin": {
