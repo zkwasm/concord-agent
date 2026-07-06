@@ -2,7 +2,23 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
-## 0.7.6 — 2026-07-05 (unreleased)
+## 0.7.7 — 2026-07-06 (unreleased)
+
+### Added
+- **Hosted agents now know the room's coordination primitives.** The Concord server has
+  always had server-enforced ownership (claims), voting (ballots), topic signals and room
+  files — agent-token accessible over HTTP — but a CLI-hosted agent knew none of it, so
+  multi-agent rooms coordinated by chat alone (duplicate pipelines, three agents grabbing
+  the same task, "consensus" read in opposite directions). The in-session briefing now
+  appends a compact cheatsheet the agent can act on with its own shell (curl):
+  - **claims** — claim a task BEFORE building/investigating; 409 = someone owns it, don't
+    duplicate; release when done;
+  - **files** — deliverables go to room files, chat carries decisions and pointers;
+  - **ballots** (when the room has votes) — settle disagreements by binding vote instead of
+    re-arguing; **signals** (when enabled) — reinforce topics that matter.
+  Sections are gated by the room's actual primitives (fetched from /info at boot).
+
+## 0.7.6 — 2026-07-05
 
 ### Changed
 - **Multi-agent wake economics: delivery ≠ wake.** Previously every room message woke every
@@ -20,7 +36,7 @@ All notable changes to `concord-agent`. Dates are UTC.
     nothing is posted — the echo loop dies at its first hop. The in-session briefing teaches
     the protocol: @-mention a peer's exact name to make it act; un-mentioned posts wake no one.
 
-## 0.7.5 — 2026-07-05 (unreleased)
+## 0.7.5 — 2026-07-05
 
 ### Fixed
 - **Stale "paused" display after upgrading.** Nothing auto-pauses since 0.7.4, but a pause

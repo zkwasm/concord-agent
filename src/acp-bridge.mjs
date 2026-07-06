@@ -20,6 +20,7 @@ import { overBudget, usageReport, budgetExceededNote } from './budget.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { createEngine } from './engine.mjs';
 import { parseForm, renderQuestion, parseReply } from './elicit.mjs';
+import { coordinationCheatsheet } from './coordination.mjs';
 import { procStart } from './reclaim.mjs';
 
 if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) { console.log(usage()); process.exit(0); }
@@ -291,13 +292,24 @@ function planCard(entries) {
 // `/concord:resume` / touching .concord/ — pure confusion. Prepended to the FIRST
 // turn of every fresh session (a resumed session already has it in context).
 let briefed = false;
+// Room primitive flags, fetched once at boot (best-effort) so the briefing's
+// coordination cheatsheet only teaches what this room actually has enabled.
+let roomFlags = { hasSignals: false, hasVotes: false };
+async function fetchRoomFlags() {
+  try {
+    const r = await fetch(`${room}/info`);
+    if (r.ok) { const j = await r.json(); roomFlags = { hasSignals: !!j.hasSignals, hasVotes: !!j.hasVotes }; }
+  } catch { /* offline info is a nicety — the cheatsheet still teaches claims/files */ }
+}
+
 const briefing = () =>
   `[concord-agent bridge] You are ALREADY connected to Concord room ${CONCORD_ROOM_ID} as "${senderName}". ` +
   `This bridge relays room messages to you as "[sender] text" and posts your replies back to the room automatically. ` +
   `Do NOT run or suggest any /concord:* plugin commands (join/resume/stop) and do NOT read or write .concord/ state — the bridge owns all room I/O. ` +
   `Room protocol: (1) You are only woken by messages that @-mention "${senderName}", by humans, or by a periodic batch of the room chatter you missed — nothing is ever lost. ` +
   `(2) To make ANOTHER agent act, you MUST @-mention its exact name; un-mentioned posts are ambient status that wakes no one. ` +
-  `(3) If a message needs no action or reply from you (courtesy chatter, someone else's task, a batch with nothing for you), reply with exactly NOOP — it will not be posted. NEVER post "standing by"/"待命中" filler.`;
+  `(3) If a message needs no action or reply from you (courtesy chatter, someone else's task, a batch with nothing for you), reply with exactly NOOP — it will not be posted. NEVER post "standing by"/"待命中" filler.\n` +
+  coordinationCheatsheet({ url: CONCORD_URL, roomId: CONCORD_ROOM_ID, sessionId, ...roomFlags });
 
 async function runTurn(text) {
   if (!briefed) { briefed = true; text = `${briefing()}\n\n${text}`; }
@@ -581,6 +593,7 @@ process.on('SIGUSR1', () => { store.setPaused(null); store.setActivity('idle'); 
 process.on('SIGUSR2', () => { store.resetUsage(CONCORD_ROOM_ID); store.setActivity('idle'); console.log('SIGUSR2 → token usage counter reset'); });
 
 await joinRoom();
+await fetchRoomFlags();   // which primitives (signals/votes) the briefing's cheatsheet should teach
 try { await startEngine(); } catch (e) { die(`agent failed to start: ${e?.message || e}\n  (first run fetches the ACP adapter via npx — check network access to the npm registry, or pre-warm it by running the command printed above)`); }
 try { await startIm(); } catch (e) { console.warn('IM bridge failed to start (room-only): ' + (e?.message || e)); }
 console.log(`✓ acp-bridge up. Driving "${AGENT}" over ACP in ${AGENT_CWD} (progress=${PROGRESS ? 'on' : 'off'}, permission=${PERMISSION_POLICY}${IM_PLATFORM ? `, im=${IM_PLATFORM}` : ''}).`);
