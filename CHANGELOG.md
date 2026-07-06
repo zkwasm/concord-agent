@@ -2,7 +2,7 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
-## 0.7.7 — 2026-07-06 (unreleased)
+## 0.7.7 — 2026-07-06
 
 ### Added
 - **Hosted agents now know the room's coordination primitives.** The Concord server has
