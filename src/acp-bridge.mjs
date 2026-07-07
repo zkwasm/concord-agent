@@ -160,6 +160,24 @@ async function joinRoom() {
   // so replies silently vanish. Reusing the stored sender keeps sender==owner.
   const existing = store.getSessionId(CONCORD_ROOM_ID);
   const storedSender = store.getSender(CONCORD_ROOM_ID) || AGENT_NAME;
+  // Self-heal a persisted "-N" collision name. If a real name was chosen (AGENT_NAME is
+  // not the bare agent type) but an earlier collision left us stored under its fallback
+  // (e.g. "agent-coordinator-2"), try to reclaim the clean name FIRST — the server now
+  // frees a name whose holder has left. Success → adopt it (the ACP context is warm-
+  // resumed separately in startEngine, so no memory is lost); 409/error → fall through
+  // and resume under the stored fallback exactly as before.
+  if (AGENT_NAME && AGENT_NAME !== AGENT && storedSender !== AGENT_NAME
+      && storedSender.toLowerCase().startsWith(AGENT_NAME.toLowerCase() + '-')) {
+    try {
+      const res = await post('/join', { sender: AGENT_NAME });
+      if (res.ok) {
+        const j = await res.json(); senderName = AGENT_NAME; sessionId = j.agentSessionId; captureRoom(j); historySeeded = true;
+        store.setSessionId(CONCORD_ROOM_ID, sessionId); store.setSender(CONCORD_ROOM_ID, AGENT_NAME);
+        console.log(`✓ Concord: reclaimed name "${AGENT_NAME}" (was "${storedSender}")`);
+        return;
+      }
+    } catch { /* clean name unavailable → resume under the stored fallback below */ }
+  }
   if (existing) {
     const res = await post('/join', { sender: storedSender, agentSessionId: existing });
     if (res.ok) { const j = await res.json(); senderName = storedSender; sessionId = j.agentSessionId; captureRoom(j); historySeeded = true; store.setSessionId(CONCORD_ROOM_ID, sessionId); store.setSender(CONCORD_ROOM_ID, senderName); console.log(`✓ Concord: resumed room as "${senderName}"`); return; }

@@ -24,6 +24,14 @@ All notable changes to `concord-agent`. Dates are UTC.
   `join`/`host` now notes that the first run downloads the adapter, so the agent's initial
   silence reads as "downloading" not "stuck."
 
+### Fixed
+- **A restarted agent reclaims its chosen name instead of staying stuck on a "-N"
+  fallback.** An earlier name collision persisted the fallback (e.g. "reviewer-2") in local
+  state, so every restart resumed under the wrong name. On join, if we are stored under a
+  "-N" fallback of a chosen name, we now try to reclaim the clean name first (the server
+  frees a departed name as of the paired im-for-agents change); the ACP context is warm-
+  resumed separately, so no memory is lost.
+
 ## 0.7.11 — 2026-07-07
 
 ### Fixed
