@@ -23,11 +23,16 @@ test('fmtTok: thousands shortening', () => {
   assert.equal(fmtTok(12000), '12k');
 });
 
-test('usageReport: cumulative, shows cap when budgeted, "无上限" when not', () => {
-  assert.match(usageReport({ fresh: 1200, cached: 45000, turns: 3 }, 10000), /fresh 1\.2k\/10k 预算/);
-  assert.match(usageReport({ fresh: 1200, cached: 45000, turns: 3 }, 10000), /累计/);
-  assert.match(usageReport({ fresh: 1200, cached: 45000, turns: 3 }, 10000), /3 轮/);
-  assert.match(usageReport({ fresh: 500, cached: 0, turns: 1 }, 0), /无上限/);
+test('usageReport: cumulative, shows cap when budgeted, "no cap" when not (en default + zh)', () => {
+  const en = usageReport({ fresh: 1200, cached: 45000, turns: 3 }, 10000);
+  assert.match(en, /fresh 1\.2k\/10k budget/);
+  assert.match(en, /cumulative/i);
+  assert.match(en, /3 turns/);
+  assert.match(usageReport({ fresh: 500, cached: 0, turns: 1 }, 0), /no cap/);
+  // zh locale still supported
+  assert.match(usageReport({ fresh: 1200, cached: 45000, turns: 3 }, 10000, 'zh'), /fresh 1\.2k\/10k 预算/);
+  assert.match(usageReport({ fresh: 1200, cached: 45000, turns: 3 }, 10000, 'zh'), /3 轮/);
+  assert.match(usageReport({ fresh: 500, cached: 0, turns: 1 }, 0, 'zh'), /无上限/);
 });
 
 test('budgetExceededNote mentions the numbers (≥10k rounds to integer k)', () => {

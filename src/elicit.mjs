@@ -31,20 +31,21 @@ export function parseForm(params) {
 }
 
 // One question card. Single question keeps it flat; multiple questions number themselves.
-export function renderQuestion(form) {
+export function renderQuestion(form, locale = 'en') {
+  const zh = locale === 'zh';
   const lines = [`❓ ${form.message}`];
   const many = form.fields.length > 1;
   form.fields.forEach((f, i) => {
     const head = [f.title, f.description].filter(Boolean).join(' — ');
-    if (many) lines.push(`${i + 1}) ${head || `问题 ${i + 1}`}`);
+    if (many) lines.push(`${i + 1}) ${head || (zh ? `问题 ${i + 1}` : `Question ${i + 1}`)}`);
     else if (head) lines.push(head);
     f.options.forEach((o, j) => lines.push(`  ${j + 1}. ${o.title}`));
   });
-  const hints = ['回复编号作答'];
-  if (form.fields.some((f) => f.multi)) hints.push('多选用逗号(如 1,3)');
-  if (many) hints.push('多个问题按顺序用分号分隔(如 2; 1,3)');
-  hints.push('选项之外可直接打字', '回复 skip 跳过');
-  lines.push(`(${hints.join(';')})`);
+  const hints = zh ? ['回复编号作答'] : ['reply with the number(s)'];
+  if (form.fields.some((f) => f.multi)) hints.push(zh ? '多选用逗号(如 1,3)' : 'commas for multi-select (e.g. 1,3)');
+  if (many) hints.push(zh ? '多个问题按顺序用分号分隔(如 2; 1,3)' : 'separate questions with semicolons (e.g. 2; 1,3)');
+  hints.push(zh ? '选项之外可直接打字' : 'or type your own', zh ? '回复 skip 跳过' : 'reply skip to skip');
+  lines.push(`(${hints.join(zh ? ';' : '; ')})`);
   return lines.join('\n');
 }
 
@@ -73,9 +74,9 @@ function answerField(f, text, content) {
 
 // One reply line → CreateElicitationResponse. Never rejects a human: unmatched
 // text becomes a custom answer; only an empty reply asks again.
-export function parseReply(form, reply) {
+export function parseReply(form, reply, locale = 'en') {
   const t = (reply || '').trim();
-  if (!t) return { ok: false, hint: '(空回复)请回编号或文字作答,或回 skip 跳过。' };
+  if (!t) return { ok: false, hint: locale === 'zh' ? '(空回复)请回编号或文字作答,或回 skip 跳过。' : '(empty reply) Please answer with a number or some text, or reply skip to skip.' };
   if (/^(skip|跳过|不用|pass)$/i.test(t)) return { ok: true, response: { action: 'accept', content: {} } };
   if (/^(cancel|取消)$/i.test(t)) return { ok: true, response: { action: 'cancel' } };
   const content = {};

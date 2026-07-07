@@ -36,8 +36,9 @@ export function isArbMarker(content) {
 
 // The visible marker a winner posts. Human reads "🎯 我来接这条"; the trailing
 // token is how peers key the election to this question.
-export function buildMarker(msgId, name) {
-  return `🎯 ${name} 来接这条 ⟦arb:${msgId}⟧`;
+export function buildMarker(msgId, name, locale = 'en') {
+  const verb = locale === 'zh' ? '来接这条' : 'is taking this one';
+  return `🎯 ${name} ${verb} ⟦arb:${msgId}⟧`;
 }
 
 // Extract the target message id from a marker, or null if it isn't one.

@@ -2,6 +2,29 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.11 — 2026-07-07
+
+### Fixed
+- **Windows: the agent adapter now starts.** `spawn('npx', …)` failed on Windows with
+  `ENOENT` (npx is `npx.cmd` there, and modern Node refuses to spawn a `.cmd` without a
+  shell), so hosting any agent crashed immediately with "agent failed to start: spawn npx
+  ENOENT". The adapter is now spawned through the shell on Windows, and `shutdown()` reaps
+  the child tree with `taskkill /T` (Windows has no Unix process groups). macOS/Linux
+  behavior is byte-for-byte unchanged. The "~250MB download" note is now shown only for the
+  claude adapter — codex/gemini adapters are small shims that drive your locally installed CLI.
+
+### Changed
+- **The bridge now speaks the room's language.** It reads `room.locale` on join and localizes
+  EVERY human-facing string — both what it posts to the room and the context it feeds the
+  agent — so an English room reads as English end to end (a `zh` room keeps the Chinese as
+  before). Previously the bridge was hardcoded Chinese and, worse, fed the agent Chinese
+  context (the batched-inbox header, the briefing), which biased hosted agents toward replying
+  in Chinese even in an English room. Now the briefing carries an explicit "write every room
+  message in this language" directive, and the answer-arbitration marker, plan/usage/budget
+  cards, `/help`, `/clear`, timeout/error notes, and elicitation prompts all switch on locale.
+  The pure-logic helpers (`arbiter`, `budget`, `elicit`) gained an optional `locale` argument
+  (default `en`).
+
 ## 0.7.10 — 2026-07-07
 
 ### Changed

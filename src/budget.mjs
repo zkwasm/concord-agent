@@ -19,13 +19,19 @@ export function fmtTok(n) {
   return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k';
 }
 
-// "📊 用量(累计):fresh 1.2k/10k 预算 · 缓存读 45k · 3 轮"
-export function usageReport(usage, budgetFresh) {
+// Locale-aware (default en). zh keeps the original Chinese.
+// en: "📊 Usage (cumulative): fresh 1.2k/10k budget · cache-read 45k · 3 turns"
+export function usageReport(usage, budgetFresh, locale = 'en') {
   const u = usage || {};
-  const cap = budgetFresh > 0 ? `/${fmtTok(budgetFresh)} 预算` : '(无上限)';
-  return `📊 用量(累计):fresh ${fmtTok(u.fresh)}${cap} · 缓存读 ${fmtTok(u.cached)} · ${u.turns || 0} 轮`;
+  if (locale === 'zh') {
+    const cap = budgetFresh > 0 ? `/${fmtTok(budgetFresh)} 预算` : '(无上限)';
+    return `📊 用量(累计):fresh ${fmtTok(u.fresh)}${cap} · 缓存读 ${fmtTok(u.cached)} · ${u.turns || 0} 轮`;
+  }
+  const cap = budgetFresh > 0 ? `/${fmtTok(budgetFresh)} budget` : ' (no cap)';
+  return `📊 Usage (cumulative): fresh ${fmtTok(u.fresh)}${cap} · cache-read ${fmtTok(u.cached)} · ${u.turns || 0} turns`;
 }
 
-export function budgetExceededNote(usage, budgetFresh) {
-  return `⚠️ token 累计已达上限(fresh ${fmtTok(usage?.fresh)}/${fmtTok(budgetFresh)})。已暂停接活,由 owner 跑 \`concord budget <id> --reset\` 清零后恢复。`;
+export function budgetExceededNote(usage, budgetFresh, locale = 'en') {
+  if (locale === 'zh') return `⚠️ token 累计已达上限(fresh ${fmtTok(usage?.fresh)}/${fmtTok(budgetFresh)})。已暂停接活,由 owner 跑 \`concord budget <id> --reset\` 清零后恢复。`;
+  return `⚠️ Cumulative token cap reached (fresh ${fmtTok(usage?.fresh)}/${fmtTok(budgetFresh)}). Paused; the owner runs \`concord budget <id> --reset\` to zero it and resume.`;
 }
