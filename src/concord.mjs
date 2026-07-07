@@ -10,7 +10,7 @@
 // GROUP (whose pgid the supervisor records in its state file), confirming the whole
 // tree is dead before reporting success; `prune` sweeps orphaned adapter groups
 // left by a crashed supervisor. No orphan token-burn. See reclaim.mjs.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { openSync, createReadStream, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -63,6 +63,7 @@ Usage:
   concord rm <id> [--yes] | prune    Stop + reclaim (if running) then remove an entry / drop dead ones
   concord shutdown                   Stop EVERYTHING (owner + agents) but KEEP configs + bindings (reversible)
   concord up                         Bring the whole fleet back after shutdown (bots need no re-binding)
+  concord upgrade [--yes]            Self-update to the latest concord-agent, then restart the fleet onto it
   concord reset [--yes]              Hard wipe: stop all + delete configs + clear bindings (bots must re-bind; keeps login)
   concord version                    Show the concord-agent version (also -v / --version)
   concord help
@@ -279,10 +280,12 @@ async function startHost(mode, args) {
 function listHosts() {
   const hosts = reg.list();
   if (!hosts.length) { console.log('(no hosted agents — `concord host <agent>` or `concord join <agent>`)'); return; }
-  // One formatter for header AND rows so the (now wider) ROOM column stays aligned. The IM
-  // column (last) answers "which chat/bot is this agent hooked to" in one glance (Tom's ask).
-  const row = (c) => `${padCol(c[0], 18)} ${padCol(c[1], 8)} ${padCol(c[2], 5)} ${padCol(c[3], 20)} ${padCol(c[4], 9)} ${padCol(c[5], 7)} ${padCol(c[6], 6)} ${padCol(c[7], 6)} ${c[8]}`;
-  console.log(row(['NAME', 'AGENT', 'MODE', 'ROOM', 'STATUS', 'PID', 'UP', 'TOK', 'IM']));
+  // One formatter for header AND rows so columns stay aligned. ID (the stable host
+  // handle, e.g. claude-0431f1) is its OWN column so duplicate in-room NAMEs across
+  // rooms are always distinguishable — and it's exactly what stop/status/logs take.
+  // The IM column (last) answers "which chat/bot is this agent hooked to" at a glance.
+  const row = (c) => `${padCol(c[0], 18)} ${padCol(c[1], 14)} ${padCol(c[2], 8)} ${padCol(c[3], 5)} ${padCol(c[4], 20)} ${padCol(c[5], 9)} ${padCol(c[6], 7)} ${padCol(c[7], 6)} ${padCol(c[8], 6)} ${c[9]}`;
+  console.log(row(['NAME', 'ID', 'AGENT', 'MODE', 'ROOM', 'STATUS', 'PID', 'UP', 'TOK', 'IM']));
   // Reverse index room → binding once, so each row shows its bound chat without re-scanning.
   const bindByRoom = {};
   for (const b of Object.values(openBindings().list())) bindByRoom[b.roomId] = b;
@@ -296,9 +299,9 @@ function listHosts() {
     const bd = bindByRoom[h.room];
     const im = bd ? `${bd.platform}·${chatLabel(bd)}` : '-';
     // NAME = the agent's actual in-room sender (what the roster shows), falling back
-    // to the local label/id for hosts that haven't joined yet. `stop`/`status` still
-    // accept label or id-prefix regardless of what's displayed.
-    console.log(row([truncWidth(readSender(h.id, h.room) || h.label || h.id, 18), h.agent || '', h.mode || '', roomLabel(h), status, String(h.pid || '-'), h.started ? ago(h.started) : '-', tok, im]));
+    // to the local label, or '-' before it has joined (the ID column carries the id
+    // now). `stop`/`status` accept the full ID, a unique id-prefix, or a label.
+    console.log(row([truncWidth(readSender(h.id, h.room) || h.label || '-', 18), h.id, h.agent || '', h.mode || '', roomLabel(h), status, String(h.pid || '-'), h.started ? ago(h.started) : '-', tok, im]));
   }
 }
 
@@ -589,6 +592,53 @@ async function upAll() {
   console.log(`✓ up: ${revived} revived, ${already} already running`);
 }
 
+// `concord upgrade` — self-update the global package, then bounce the whole fleet onto the
+// new code. The trick that makes self-upgrade safe: spawnDaemon launches the ON-DISK
+// acp-bridge.mjs, which npm has just overwritten in place — so the REVIVED daemons run the
+// new version even though THIS orchestrating process is still the old one. No re-exec, no
+// mixed-version process (we do zero dynamic imports of the upgraded code after installing).
+async function upgradeCmd(args) {
+  const force = args.includes('--yes') || args.includes('-y') || args.includes('--force');
+  const PKG = 'concord-agent';
+  // What's published vs what we run now. Best-effort — offline just skips the shortcut.
+  let latest = null;
+  try { const v = spawnSync(`npm view ${PKG} version`, { shell: true, encoding: 'utf8' }); if (v.status === 0) latest = String(v.stdout || '').trim() || null; }
+  catch { /* registry unreachable — fall through to install, which shows its own error */ }
+  if (latest && latest === VERSION && !force) {
+    console.log(`✓ already on the latest ${PKG} (${VERSION}) — nothing to upgrade.\n  (re-install + bounce the fleet anyway:  concord upgrade --force)`);
+    return;
+  }
+  console.log(`↑ upgrading ${PKG}: ${VERSION} → ${latest || 'latest'} …`);
+  // Install with stdio inherited so the user sees npm's own progress AND any error (perms,
+  // network). CONCORD_UPGRADE_CMD overrides the installer for pnpm/yarn/bun/sudo setups.
+  const custom = process.env.CONCORD_UPGRADE_CMD;
+  const r = spawnSync(custom || `npm install -g ${PKG}@latest`, { shell: true, stdio: 'inherit' });
+  if (r.status !== 0) {
+    die(`install failed (exit ${r.status ?? '?'}).\n  If this is a permissions error (EACCES) your global npm dir needs sudo:\n    sudo npm i -g ${PKG}@latest   &&   concord shutdown && concord up\n  Or set CONCORD_UPGRADE_CMD to your installer (e.g. "pnpm add -g ${PKG}@latest").`);
+  }
+  // Confirm what actually landed by re-reading the freshly-written package.json.
+  let now = null;
+  try { now = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).version; } catch { /* best effort */ }
+  console.log(`✓ installed ${PKG}${now ? ` ${now}` : ''}`);
+  // Bounce the fleet so every daemon reloads the new code. Nothing running → the new
+  // version simply applies on the next `concord up` / `host` / `join`.
+  const running = reg.list().filter((h) => h.alive);
+  if (!running.length) { console.log('  (no running hosts — the new version applies on your next `concord up` / `host` / `join`.)'); return; }
+  // Bouncing interrupts the current turn of any WORKING agent (warm resume keeps its context;
+  // the next message continues). Confirm before yanking one mid-task, unless --yes.
+  const working = running.filter((h) => readRuntime(h.id).activity?.state === 'working');
+  if (working.length && !force) {
+    if (!process.stdin.isTTY) { console.log(`  ⚠️ 新版已装,但没重启:${working.length} 个 agent 正在工作,非交互环境不擅自打断。空闲时执行:  concord shutdown && concord up`); return; }
+    if (!(await confirm(`⚠️ ${working.length} 个 agent 正在工作。重启会打断当前这一轮(warm resume 恢复上下文,下条消息可继续)。现在重启?`))) {
+      console.log('  已装新版;稍后手动 `concord shutdown && concord up` 生效。'); return;
+    }
+  }
+  console.log(`↻ restarting ${running.length} running host(s) onto ${now || 'the new version'} …`);
+  await shutdownAll();
+  await upAll();
+  console.log(`✓ upgrade complete — fleet is on ${now || 'the new version'}.`);
+}
+
 // HARD teardown: stop everything, drop every registry entry AND every IM binding — a clean
 // slate. Bots must be re-bound (/concord-bind) afterwards. Does NOT touch login creds (that's
 // `concord logout`). Destructive → confirm unless --yes.
@@ -876,6 +926,7 @@ switch (cmd) {
   case 'rm': positional[0] ? await rmHost(positional[0], { yes }) : die('usage: concord rm <id> [--yes]'); break;
   case 'prune': await prune(); break;
   case 'up': await upAll(); break;
+  case 'upgrade': await upgradeCmd(rest); break;
   case 'shutdown': await shutdownAll(); break;
   case 'reset': await resetAll({ yes }); break;
   case 'resume': rest[0] ? resumeHost(rest[0]) : die('usage: concord resume <id>'); break;

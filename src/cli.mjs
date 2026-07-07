@@ -73,11 +73,13 @@ export function resolveConfig(argv, env = {}) {
 // Wake economics: DELIVERY (the agent's context must contain every room message,
 // in order) is nearly free via the batched inbox; a WAKE (an LLM turn) is the
 // expensive part and must signal addressed intent. Classification:
-//   'skip'  — own echoes (already in its context)
+//   'skip'  — own echoes (already in its context), and pure standing-by/NOOP
+//             filler from other agents (no content, no context → dropped, so an
+//             idle room can't sustain a "待命中" echo)
 //   'wake'  — @-mentions me (anyone), or a human message with no @ at all
 //   'defer' — everything else: agents' un-mentioned chatter/status posts,
 //             messages @-ing others, system notices. Delivered later as one
-//             batched context block (or by the timed inbox flush), never a
+//             batched context block on the agent's next NATURAL wake, never a
 //             per-message turn — so N agents can't bill each other for small talk.
 // Mentions come server-resolved (m.mentions); a text-scan fallback covers relays
 // that don't carry the field.
@@ -95,10 +97,46 @@ export function classifyInbound(m, selfName) {
     if (selfName && content.includes(`@${selfName}`)) return 'wake';
     if (/(^|\s)@\S{1,32}/.test(content)) return 'defer';      // @-ing someone that isn't me
   }
+  // A pure standing-by / NOOP filler broadcast carries no content and no context;
+  // dropping it (not even inboxing) is what stops an idle room from sustaining a
+  // "待命中" echo. @-me was already resolved to 'wake' above, so this only hits
+  // un-addressed agent posts.
+  if (m.senderType !== 'human' && isFiller(m.content)) return 'skip';
   return m.senderType === 'human' ? 'wake' : 'defer';         // bare broadcast: humans wake everyone; agent status posts don't
 }
 
 // Back-compat shim (0.7.3 name): anything not 'skip' used to relay.
 export function shouldRelayInbound(m, selfName) {
   return classifyInbound(m, selfName) !== 'skip';
+}
+
+// A "bare human broadcast": a human message addressed to NO ONE (no mentions, no
+// @ anywhere). This is the ONLY kind of wake that answer-arbitration acts on — an
+// @-mention (of me or anyone) is deliberately excluded, so a human who @-picks a
+// specific agent still gets an immediate, un-arbitrated reply. Mirrors the
+// classifyInbound branch `senderType==='human' && no @ → wake`.
+export function isBareHumanBroadcast(m, selfName) {
+  if (!m) return false;
+  if ((m.senderType || 'human') !== 'human') return false;
+  if (m.sender === selfName) return false;
+  const mentions = Array.isArray(m.mentions) ? m.mentions : null;
+  if (mentions && mentions.length) return false;                 // addressed to someone
+  if (/(^|\s)@\S{1,32}/.test(String(m.content || ''))) return false;   // text-scan fallback for relays w/o mentions
+  return true;
+}
+
+// A "pure filler" broadcast: a bare NOOP, or a short standing-by line ("待命中",
+// "NOOP —— 待命中", "standing by"). It carries no action and no context — the fuel
+// of the multi-agent echo loop. NARROW by design: anything with real substance
+// (a status report that merely opens with "NOOP", or anything ≥ a short line) is
+// NOT filler and must pass through; a message addressing someone (@) is never
+// filler. Used both to suppress an agent's own filler output and to drop peers'
+// filler on the way in.
+export function isFiller(content) {
+  let s = String(content == null ? '' : content).trim();
+  if (s === '') return false;                                                   // empty isn't filler — the ✓/silent branches own that
+  if (/@\S/.test(s)) return false;                                              // addresses someone → real
+  s = s.replace(/^[\s(（【\[]*noop\b[\s)）】\]:：—–\-.。!！,，、]*/i, '').trim();  // strip a leading NOOP token + its trailing dashes/punct
+  if (s === '') return true;                                                     // bare NOOP (± punctuation)
+  return s.length <= 16 && /^(待\s*命|standing\s*by)/i.test(s);                  // short line that OPENS with a standing-by phrase
 }

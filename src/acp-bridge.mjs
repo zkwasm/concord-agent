@@ -15,12 +15,13 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openStore } from './store.mjs';
 import { toolToProgress, toolDetail } from './render.mjs';
-import { resolveConfig, usage, classifyInbound } from './cli.mjs';
+import { resolveConfig, usage, classifyInbound, isBareHumanBroadcast, isFiller } from './cli.mjs';
 import { overBudget, usageReport, budgetExceededNote } from './budget.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { createEngine } from './engine.mjs';
 import { parseForm, renderQuestion, parseReply } from './elicit.mjs';
 import { coordinationCheatsheet } from './coordination.mjs';
+import { isArbMarker, buildMarker, parseMarker, arbBackoffMs, arbWin } from './arbiter.mjs';
 import { procStart } from './reclaim.mjs';
 
 if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) { console.log(usage()); process.exit(0); }
@@ -361,26 +362,21 @@ async function runTurn(text) {
 
 // ── Deferred-message inbox ──────────────────────────────────────────────────
 // Un-addressed chatter never wakes the agent per-message; it lands in the inbox
-// and is flushed as ONE batched context block on the next natural wake — or, so
-// a room where everyone only broadcasts can't fall silent forever, by a timed
-// digest wake (ACP_INBOX_FLUSH seconds, default 600; 0 disables the timer).
-const INBOX_FLUSH_MS = (() => { const raw = parseInt(process.env.ACP_INBOX_FLUSH ?? '600', 10); return (Number.isFinite(raw) && raw >= 0 ? raw : 600) * 1000; })();
-let inboxTimer = null;
-
+// and is delivered as ONE batched context block on the agent's next NATURAL wake
+// (an @-mention, or a human message it's elected to answer). No timer, no
+// speculative wake: an idle room with nothing addressed to anyone simply stays
+// silent — and free — until something real happens. That silence is the correct
+// resting state, not a stall. (A timed "digest" wake used to live here; it was
+// the engine of the multi-agent NOOP echo loop — every ~10 min it re-woke idle
+// agents, who re-emitted "待命中", which refilled peers' inboxes forever — so it's
+// gone. Coordination is by @-mention: to make someone act, address them.)
 function deferInbound(sender, content) {
   store.pushInbox(CONCORD_ROOM_ID, sender, content);
   console.log(`· deferred | ${sender}: ${String(content).slice(0, 60)}`);
-  if (!INBOX_FLUSH_MS || inboxTimer) return;
-  inboxTimer = setTimeout(() => {
-    inboxTimer = null;
-    if (!store.getInbox(CONCORD_ROOM_ID).length) return;   // already flushed by a natural wake
-    pending.push({ digest: true, imChat: null });
-    drain();
-  }, INBOX_FLUSH_MS);
 }
 
-// A turn's input = the batched inbox (if any) + the triggering message. The
-// digest wake carries only the batch, with an explicit "act or NOOP" framing.
+// A turn's input = the batched inbox (missed context, if any) prepended to the
+// message that actually woke the agent.
 function composeTurn(item) {
   const inbox = store.getInbox(CONCORD_ROOM_ID);
   let head = '';
@@ -390,7 +386,6 @@ function composeTurn(item) {
       + inbox.map((x) => `[${x.sender}] ${x.content}`).join('\n') + '\n\n';
     store.clearInbox(CONCORD_ROOM_ID);
   }
-  if (item.digest) return head + '(以上为批量同步。其中若有需要你行动或回应的内容就处理;没有就只回 NOOP。)';
   return head + item.text;
 }
 
@@ -413,6 +408,94 @@ function maybeBudgetWarn() {
   }
 }
 
+// ── Answer arbitration (multi-agent rooms only) ─────────────────────────────
+// A bare human question (no @-mention) wakes EVERY agent → they'd all answer the
+// same thing. Instead the candidates hold a fast election over the ROOM MESSAGE
+// STREAM (no server support, no coordination-primitives switch): roll a random
+// backoff; the first to fire posts a visible "picking this up" marker; the rest
+// see it and stand down — their copy of the question stays in their inbox as
+// context, delivered on their next natural wake ("stagger, not suppress"). The
+// elected agent answers; there is no timed fallback, so on the rare occasion it
+// judges no reply is needed, the human simply re-asks or @-mentions someone.
+// Near-simultaneous posters resolve by a deterministic name tie-break, so exactly
+// one proceeds. A genuine SINGLE-AGENT room can never
+// populate `presenceSeen`, so this is fully inert there — same immediate answer,
+// zero added latency, no markers. Kill switch: ACP_ARB=0.
+const ARB_ON = process.env.ACP_ARB !== '0';
+const ARB_SETTLE_MS = 500;                 // after posting my marker, briefly gather same-window rivals, then tie-break
+const PRESENCE_WINDOW_MS = 5 * 60 * 1000;  // an agent counts as present if it posted within this window (matches server presence)
+const presenceSeen = new Map();            // agentName → last-seen ms — populated ONLY by OTHER agents actually posting
+const arbPending = new Map();              // target msgId → { msg:{sender,content}, posted, timer }
+const seenMarkers = new Map();             // target msgId → { names:Set<claimant>, ts } (ttl-pruned)
+
+function recordPresence(name) {
+  if (name && name !== senderName) presenceSeen.set(name, Date.now());
+}
+// True only if another agent posted within the window. A single-agent room can
+// NEVER set this, which is exactly what keeps arbitration off there.
+function hasPeers() {
+  const now = Date.now();
+  for (const [n, t] of presenceSeen) if (now - t > PRESENCE_WINDOW_MS) presenceSeen.delete(n);
+  return presenceSeen.size > 0;
+}
+
+// A marker seen in the stream (from anyone, incl. my own echo): record it, and if
+// a rival claimed the question I'm still backing off on, stand down immediately.
+function onArbMarker(m) {
+  const target = parseMarker(m.content);
+  if (!target) return;
+  recordPresence(m.sender);                                    // a marker proves a live peer
+  const now = Date.now();
+  for (const [k, v] of seenMarkers) if (now - v.ts > 60000) seenMarkers.delete(k);
+  const rec = seenMarkers.get(target) || { names: new Set(), ts: now };
+  rec.names.add(m.sender); rec.ts = now; seenMarkers.set(target, rec);
+  const e = arbPending.get(target);
+  if (e && !e.posted && m.sender !== senderName) {             // a rival beat me → stand down (defer, don't drop)
+    clearTimeout(e.timer); arbPending.delete(target);
+    console.log(`· arb | ${m.sender} took ${String(target).slice(0, 8)} → standing down`);
+    deferInbound(e.msg.sender, e.msg.content);
+  }
+}
+
+// Begin an election for a bare human question: back off, then (if not preempted)
+// post my marker; after a short settle, win (answer) or lose the tie-break (defer).
+function startElection(m) {
+  const target = m.id;
+  if (arbPending.has(target)) return;
+  const pre = seenMarkers.get(target);
+  if (pre && [...pre.names].some((n) => n !== senderName)) { deferInbound(m.sender, m.content); return; }  // already claimed
+  const entry = { msg: { sender: m.sender, content: m.content }, posted: false, timer: null };
+  entry.timer = setTimeout(() => onBackoffFire(target), arbBackoffMs());
+  arbPending.set(target, entry);
+}
+
+async function onBackoffFire(target) {
+  const entry = arbPending.get(target);
+  if (!entry) return;                                          // preempted during backoff
+  entry.posted = true;
+  await post('/messages', { sender: senderName, agentSessionId: sessionId, content: buildMarker(target, senderName) }).catch(() => {});
+  setTimeout(() => {
+    if (!arbPending.has(target)) return;
+    arbPending.delete(target);
+    const rec = seenMarkers.get(target);
+    const rivals = rec ? [...rec.names].filter((n) => n !== senderName) : [];
+    if (rivals.length && !arbWin(senderName, rivals)) {        // rare same-window collision, lost tie-break
+      console.log(`· arb | lost tie-break for ${String(target).slice(0, 8)} → standing down`);
+      deferInbound(entry.msg.sender, entry.msg.content);
+    } else {
+      handleInbound({ text: entry.msg.content, sender: entry.msg.sender, imChat: null, senderType: 'human' }).catch((e) => console.error('arb handoff failed:', e?.message || e));
+    }
+  }, ARB_SETTLE_MS);
+}
+
+// Route this wake through arbitration instead of an immediate turn? Only bare
+// human questions, only with peers present, and never for a command / an open
+// question / an over-budget agent — those keep their existing immediate handling.
+function arbEligible(m) {
+  return ARB_ON && hasPeers() && isBareHumanBroadcast(m, senderName)
+    && !String(m.content || '').trim().startsWith('/') && !pendingElicit && !budgetBlocked();
+}
+
 async function drain() {
   if (busy || pending.length === 0) return;
   busy = true;
@@ -429,7 +512,7 @@ async function drain() {
       }
       pending.shift();
       currentImChat = item.imChat;                             // route this turn's progress + reply to its IM chat (if any)
-      const label = item.digest ? '(inbox digest)' : item.text;
+      const label = item.text;
       console.log(`\n▶ turn start  ·  ${label.slice(0, 80)}`);
       store.setActivity('working', label.replace(/^\[[^\]]*\]\s*/, '').slice(0, 60));   // surface to `concord list`/`status`
       try {
@@ -437,12 +520,13 @@ async function drain() {
         recreateTimes = [];                                    // a clean turn means the engine recovered → reset the crash-loop guard
         store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached);
         maybeBudgetWarn();                                     // surface 80%-of-budget before the cap pauses us
-        // The agent has a right to SILENCE: NOOP (or an empty, tool-less turn) posts
-        // nothing — replying "待命中" to every wake is what fuels multi-agent echo
-        // loops. A turn that DID work but ended text-less still confirms with ✓
-        // (Claude Code sometimes puts the conclusion in a summary the adapter drops).
+        // The agent has a right to SILENCE: a NOOP — or the "待命中" filler agents
+        // pad it with, which `isFiller` also catches — posts NOTHING. This is what
+        // keeps an idle room quiet instead of billing every agent to announce it's
+        // standing by. A turn that DID work but ended text-less still confirms with
+        // ✓ (Claude Code sometimes puts the conclusion in a summary the adapter drops).
         const txt = reply.trim();
-        if (/^[\s((]*NOOP[\s))。.!]*$/i.test(txt)) console.log('■ NOOP — nothing to say, staying silent');
+        if (isFiller(txt)) console.log('■ NOOP/filler — nothing to say, staying silent');
         else if (txt) await out(txt);                          // agent's full reply -> room + IM chat
         else if (tools > 0) await out('✓ 完成');
         else console.log('■ empty reply, no tools — staying silent');
@@ -547,11 +631,14 @@ async function pollLoop() {
       const res = await fetch(`${room}/messages?session=${sessionId}&wait=30`);
       if (res.status === 401) { console.warn('Concord session expired → rejoin'); await joinRoom(); continue; }
       for (const m of (await res.json()).messages || []) {
+        if (isArbMarker(m.content)) { onArbMarker(m); continue; }   // election signal — for the arbiter only, never the LLM
         const cls = classifyInbound(m, senderName);        // wake = addressed intent; defer = ambient chatter → inbox; skip = own echo
         if (cls === 'skip') continue;
         if (store.wasProcessedInbound(m.id)) continue;   // already handled (resume / redelivery)
         store.markProcessedInbound(m.id);
+        if (m.senderType === 'agent') recordPresence(m.sender);   // observed live presence is what gates arbitration
         if (cls === 'defer') { deferInbound(m.sender, m.content); continue; }
+        if (arbEligible(m)) { startElection(m); continue; }   // bare human question + peers present → elect one answerer
         await handleInbound({ text: m.content, sender: m.sender, imChat: null, senderType: m.senderType || 'human' });   // room message → reply to room only
       }
       if (++n % 10 === 0) await post('/heartbeat', { agentSessionId: sessionId });

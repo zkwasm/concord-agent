@@ -2,6 +2,68 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.10 — 2026-07-07
+
+### Changed
+- **`concord list` now has an `ID` column.** The in-room NAME can collide across rooms (two
+  rooms each with a "novel-agent-alice"), so listing by name alone was ambiguous. The stable
+  host id (e.g. `claude-0431f1`) now has its own column right after NAME — always unique, and
+  exactly what `stop`/`status`/`logs`/`restart` accept (full id or a unique prefix). NAME
+  shows the in-room sender (or `-` before it joins); the id no longer doubles as the NAME
+  fallback since it has its own column.
+
+## 0.7.9 — 2026-07-07
+
+### Changed
+- **Killed the multi-agent "待命中" echo loop — coordination is now purely event-driven.**
+  A blocked room (e.g. everyone waiting on a human decision) used to burn tokens forever:
+  a timed digest re-woke every idle agent ~every 10 min, each replied `NOOP —— 待命中`,
+  which refilled the others' inboxes and re-armed the timer — a self-sustaining loop with
+  zero output. Two root causes, both fixed:
+  - **Removed the timed digest wake** (`ACP_INBOX_FLUSH` is gone). Un-addressed chatter still
+    lands in the inbox and is delivered as one batched context block on the agent's next
+    **natural** wake (an @-mention, or a human message it's elected to answer) — but nothing
+    re-wakes an idle agent on a clock. A room with nothing addressed to anyone simply stays
+    silent and free until something real happens; that silence is correct, not a stall.
+    Coordination is by @-mention: to make an agent act, address it.
+  - **Silence now actually means silence.** The "reply `NOOP` to stay quiet" rule only ever
+    swallowed a *bare* `NOOP`; agents habitually append "待命中", which slipped through and got
+    posted. A narrow `isFiller()` check now treats a bare `NOOP` and short standing-by lines
+    ("NOOP —— 待命中", "待命中", "standing by") as silence on the way out, and drops peers'
+    filler on the way in (`classifyInbound` → skip: not even inboxed). Substantive posts — a
+    status report that merely opens with "NOOP", anything addressed with `@` — pass through
+    untouched.
+- Answer arbitration (0.7.8) is unchanged in mechanism; a stood-down agent keeps the question
+  as inbox context for its next natural wake. There is no timed fallback, so on the rare
+  occasion the elected agent judges no reply is needed, the human simply re-asks or @-mentions.
+
+## 0.7.8 — 2026-07-06
+
+### Added
+- **Answer arbitration: one agent replies to a bare question, not all of them.** In a
+  multi-agent room, a human question with no @-mention woke every agent and they all
+  drafted the same answer — pure duplicate work. Agents now hold a fast election over the
+  room message stream (inspired by *Drosophila* sensory-bristle selection — lateral
+  inhibition picks one cell): each candidate rolls a short random backoff; the first to fire
+  posts a visible "🎯 …来接这条" marker; the rest see it and **stand down**. A stander-down
+  does not drop the question — it defers it to its own inbox ("stagger, not suppress"), so
+  nothing is lost and a silent winner is still covered by the timed digest. Rare
+  same-instant posters resolve by a deterministic name tie-break, so exactly one proceeds.
+  - **Message-log based — zero server changes, no coordination-primitives switch.** It rides
+    the single most reliable path in the system (posting/reading messages); it does not
+    touch claims/ballots/signals.
+  - **Single-agent rooms are completely inert.** Arbitration only engages once another agent
+    has actually been observed posting (a genuine single-agent room can never trigger it):
+    same immediate answer, zero added latency, no markers.
+  - Excluded from arbitration (kept immediate): `@`-mentions (of anyone), in-room commands
+    (`/…`), an open agent question, and over-budget agents. Kill switch: `ACP_ARB=0`.
+- **`concord upgrade`** — one command to self-update and roll the whole fleet onto the new
+  code: it runs `npm i -g concord-agent@latest`, then `shutdown` + `up`. Because the revived
+  daemons launch the freshly-overwritten on-disk bridge, they come back on the new version
+  (warm resume keeps each agent's context). Skips the reinstall when already latest
+  (`--force` to bounce anyway); prompts before interrupting a working agent (`--yes` to
+  skip); `CONCORD_UPGRADE_CMD` overrides the installer for pnpm/yarn/bun/sudo setups.
+
 ## 0.7.7 — 2026-07-06
 
 ### Added
