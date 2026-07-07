@@ -130,8 +130,18 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
     // first run reads as "downloading" not "hung" (this await is what blocked startup before
     // pollLoop). Subsequent runs hit the npx cache and start instantly.
     log(`▸ starting the ${agent} adapter: ${cmd} ${args.join(' ')}`);
-    log(`  (first use on this machine downloads the agent runtime, ~250MB — can take a few minutes; cached afterwards)`);
-    child = spawn(cmd, args, { cwd, stdio: ['pipe', 'pipe', 'inherit'], detached: true });
+    // Only the claude adapter pulls the big (~250MB) native runtime; codex/gemini
+    // adapters are small npm shims that DRIVE your locally-installed CLI, so don't
+    // scare non-claude users with a 250MB download that never happens.
+    if (!process.env.ACP_ADAPTER_CMD) log(agent === 'claude'
+      ? `  (first use on this machine downloads the agent runtime, ~250MB — can take a few minutes; cached afterwards)`
+      : `  (first use fetches the ${agent} ACP adapter via npx — small, cached afterwards; it drives your locally-installed ${agent} CLI)`);
+    // Windows: `npx` is `npx.cmd`; a bare spawn can't resolve it (ENOENT) and modern
+    // Node refuses to spawn a .cmd without a shell (EINVAL) — so run through the shell.
+    // Windows also has no Unix process groups, so `detached` (group-leader) is moot;
+    // shutdown() reaps the whole child tree with `taskkill /T` instead.
+    const isWin = process.platform === 'win32';
+    child = spawn(cmd, args, { cwd, stdio: ['pipe', 'pipe', 'inherit'], detached: !isWin, shell: isWin });
     source = acp.ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout));
   }
 
@@ -235,7 +245,16 @@ export function createEngine({ agent, cwd, permission = 'approve-all', log = con
   async function shutdown({ graceMs = 4000 } = {}) {
     shutdownResolve();
     if (!child || !child.pid) return;
-    const pgid = child.pid;
+    const pid = child.pid;
+    if (process.platform === 'win32') {
+      // No Unix process groups here: `process.kill(-pid)` is unsupported. Walk and
+      // force-kill the whole child tree (shell → npx → adapter → agent) by pid.
+      try { spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' }); } catch { /* already gone */ }
+      const start = Date.now();
+      while (!exited && pidAlive(pid) && Date.now() - start < graceMs) await sleep(100);
+      return;
+    }
+    const pgid = pid;
     try { process.kill(-pgid, 'SIGTERM'); } catch { /* group already gone */ }
     const start = Date.now();
     while (!exited && pidAlive(pgid) && Date.now() - start < graceMs) await sleep(100);
