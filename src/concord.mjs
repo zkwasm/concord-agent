@@ -100,8 +100,8 @@ function ask(question) {
 async function pickAgentName({ dir, agentType, url, room }) {
   const { candidates } = await suggestNames({ dir, agentType, url, roomId: room, log: console.log });
   if (!candidates.length) return null;
-  console.log('  给这个 agent 起个名字(它在房间里负责什么?):');
-  candidates.forEach((c, i) => console.log(`    ${i + 1}. ${c}${i === 0 ? '   (回车默认)' : ''}`));
+  console.log('  Name this agent (what does it own in the room?):');
+  candidates.forEach((c, i) => console.log(`    ${i + 1}. ${c}${i === 0 ? '   (Enter = default)' : ''}`));
   const a = await ask('  name> ');
   if (!a) return candidates[0];
   const n = parseInt(a, 10);
@@ -120,7 +120,7 @@ const truncWidth = (s, max) => { s = String(s); if (dispWidth(s) <= max) return 
 const roomLabel = (h) => truncWidth(h.roomName || shortRoom(h.room), 20);
 // How the IM side of a binding reads in list/status: the resolved group name, else 私聊(shortid)
 // for a p2p chat (Lark p2p has no title) — never the bare opaque oc_ id on its own.
-const chatLabel = (bd, w = 14) => (bd.chatName ? truncWidth(bd.chatName, w) : `私聊(${truncWidth(bd.chatId, Math.max(6, w - 4))})`);
+const chatLabel = (bd, w = 14) => (bd.chatName ? truncWidth(bd.chatName, w) : `DM(${truncWidth(bd.chatId, Math.max(6, w - 4))})`);
 // Rooms served by a LIVE local agent (fresh pid check). The authoritative, always-current
 // agent-presence for CLI displays — the owner's health snapshot only refreshes each reconcile
 // (~45s), so a just-`stop`ped agent would still read "present" there. Same box as the agents.
@@ -226,13 +226,13 @@ async function startHost(mode, args) {
     const servedBy = reg.list().find((h) => h.mode !== 'im' && h.room === room && h.alive);
     if (servedBy) {
       const startNew = args.includes('--new-agent') ? true : args.includes('--reuse') ? false
-        : await confirm(`room ${shortRoom(room)} 已有活 agent ${servedBy.id}。新起一个独立 agent(不复用)?`);
+        : await confirm(`room ${shortRoom(room)} already has a live agent ${servedBy.id}. Start a separate new agent (don't reuse)?`);
       if (!startNew) {
         const platform = resolveImPlatform(cfg, 'host');
         if (!platform) die('--bind needs a logged-in IM platform — `concord login lark --qr`.');
         const res = openBindings().bind(platform, cfg.bind, { roomId: room, agent: servedBy.agent, cwd: servedBy.cwd }, { force: cfg.force });
         if (!res.ok) die(`chat ${cfg.bind} is already bound to room ${shortRoom(res.existing.roomId)} — add --force to rebind`);
-        console.log(`✓ 复用 ${servedBy.id}(room ${shortRoom(room)})· 绑定 ${platform} chat ${cfg.bind} → 同一房间。owner 会把消息转发给它。`);
+        console.log(`✓ reusing ${servedBy.id} (room ${shortRoom(room)}) · bound ${platform} chat ${cfg.bind} → same room. The owner relays messages to it.`);
         return;
       }
     }
@@ -265,7 +265,7 @@ async function startHost(mode, args) {
   if (!name && process.stdin.isTTY && process.stdout.isTTY) {
     try { name = await pickAgentName({ dir: cwd, agentType: cfg.agent, url: cfg.url, room }); }
     catch { /* naming is a nicety — never block the start */ }
-    if (name) console.log(`  ✓ 将以「${name}」加入房间`);
+    if (name) console.log(`  ✓ Joining the room as "${name}"`);
   }
   const f = {
     agent: cfg.agent, mode, room, cwd, url: cfg.url, im, bound,
@@ -273,8 +273,9 @@ async function startHost(mode, args) {
     ...(name ? { name, label: cfg.label || name } : {}),
     budget: cfg.budget || null,
   };
+  const firstHost = !reg.list().some((h) => h.mode !== 'im');   // heuristic: first-ever host → the adapter isn't cached yet
   const pid = spawnDaemon(id, f, { fg });
-  if (!fg) console.log(`✓ ${mode} started — id ${id} · pid ${pid} · agent ${cfg.agent} · room ${shortRoom(room)}${im ? ` · im ${im}` : ''}\n  concord logs ${id}   ·   concord stop ${id}`);
+  if (!fg) console.log(`✓ ${mode} started — id ${id} · pid ${pid} · agent ${cfg.agent} · room ${shortRoom(room)}${im ? ` · im ${im}` : ''}\n  concord logs ${id}   ·   concord stop ${id}${firstHost ? `\n  (first run downloads the ${cfg.agent} ACP adapter${cfg.agent === 'claude' ? ' + its ~250MB runtime' : ''} — give it a minute before the agent can reply)` : ''}`);
 }
 
 function listHosts() {
@@ -587,7 +588,7 @@ async function upAll() {
   const boundPlatforms = new Set(Object.values(openBindings().list()).map((b) => b.platform));
   for (const platform of IM_PLATFORMS.filter((p) => getCreds(p) && boundPlatforms.has(p))) {
     try { const { pid, started } = await startImOwnerIfNeeded(platform); if (started) { console.log(`✓ up IM owner (${platform}) — pid ${pid}`); revived++; } else already++; }
-    catch (e) { console.log(`⚠️  IM owner (${platform}) 启动失败:${e?.message || e}`); }
+    catch (e) { console.log(`⚠️  IM owner (${platform}) failed to start: ${e?.message || e}`); }
   }
   console.log(`✓ up: ${revived} revived, ${already} already running`);
 }
@@ -628,9 +629,9 @@ async function upgradeCmd(args) {
   // the next message continues). Confirm before yanking one mid-task, unless --yes.
   const working = running.filter((h) => readRuntime(h.id).activity?.state === 'working');
   if (working.length && !force) {
-    if (!process.stdin.isTTY) { console.log(`  ⚠️ 新版已装,但没重启:${working.length} 个 agent 正在工作,非交互环境不擅自打断。空闲时执行:  concord shutdown && concord up`); return; }
-    if (!(await confirm(`⚠️ ${working.length} 个 agent 正在工作。重启会打断当前这一轮(warm resume 恢复上下文,下条消息可继续)。现在重启?`))) {
-      console.log('  已装新版;稍后手动 `concord shutdown && concord up` 生效。'); return;
+    if (!process.stdin.isTTY) { console.log(`  ⚠️ New version installed but NOT restarted: ${working.length} agent(s) are working, and a non-interactive shell won't interrupt them. When idle, run:  concord shutdown && concord up`); return; }
+    if (!(await confirm(`⚠️ ${working.length} agent(s) are working. Restarting interrupts the current turn (warm resume restores context; the next message continues). Restart now?`))) {
+      console.log('  New version installed; run `concord shutdown && concord up` later to apply it.'); return;
     }
   }
   console.log(`↻ restarting ${running.length} running host(s) onto ${now || 'the new version'} …`);
@@ -646,11 +647,11 @@ async function resetAll({ yes } = {}) {
   const hosts = reg.list();
   const nB = Object.keys(openBindings().list()).length;
   if (!hosts.length && !nB) { console.log('(already a clean slate — nothing to reset)'); return; }
-  if (!yes && !(await confirm(`Reset 会停止 ${hosts.length} 个 host、删除它们的配置,并清掉 ${nB} 个 IM 绑定(bot 需重新 /concord-bind)。继续?`))) { console.log('(已取消)'); return; }
+  if (!yes && !(await confirm(`Reset will stop ${hosts.length} host(s), delete their config, and clear ${nB} IM binding(s) (bots must re-run /concord-bind). Continue?`))) { console.log('(cancelled)'); return; }
   for (const h of hosts) { await stopHostCmd(h.id, { silent: true }); reg.unregister(h.id, { removeState: true }); console.log(`✓ stopped + removed ${h.id}`); }
   openBindings().clear();
   console.log(`✓ cleared ${nB} IM binding(s)`);
-  console.log('✓ reset —— 干净 slate。(登录凭据保留;在聊天里发 /concord-bind 重新绑定 bot。)');
+  console.log('✓ reset — clean slate. (Login creds are kept; run /concord-bind in the chat to re-bind a bot.)');
 }
 
 // Clear a stale pause record on a running host (SIGUSR1). Nothing auto-pauses
@@ -701,24 +702,24 @@ function budgetCmd(id, args) {
 async function loginViaQR(platform, opts = {}) {
   const existing = getCreds(platform);
   if (existing && !opts.new && !opts.force) {
-    console.log(`\n✓ 已登录 ${platform}:appId ${existing.appId}(凭据已存在,跳过扫码以免重建应用)`);
-    console.log('  · 想换/补建一个新应用:  concord login ' + platform + ' --qr --new');
-    console.log('  · 想用同一应用重新扫码:  concord login ' + platform + ' --qr --force');
+    console.log(`\n✓ Already logged in to ${platform}: appId ${existing.appId} (creds exist; skipping the QR scan so we don't recreate the app)`);
+    console.log('  · Create a different/new app:   concord login ' + platform + ' --qr --new');
+    console.log('  · Re-scan with the same app:    concord login ' + platform + ' --qr --force');
     // Idempotent: still ensure the owner is up. Re-running this command becomes a
     // safe "check + repair" — useful after a reboot that lost the daemon.
     try {
       const { pid, started, restarted } = await startImOwnerIfNeeded(platform, undefined);
-      const how = restarted ? '✓ IM owner 已对齐当前应用并重启' : started ? '✓ IM owner 已启动' : '✓ IM owner 已在运行';
-      console.log(`\n${how} (pid ${pid}) — 直接去聊天发 /concord-bind 即可。`);
+      const how = restarted ? '✓ IM owner realigned to the current app and restarted' : started ? '✓ IM owner started' : '✓ IM owner already running';
+      console.log(`\n${how} (pid ${pid}) — just run /concord-bind in the chat.`);
     } catch (e) {
-      console.log('\n⚠️  自动启动 IM owner 失败:' + (e?.message || e));
+      console.log('\n⚠️  Failed to auto-start the IM owner: ' + (e?.message || e));
     }
     return;
   }
   const { registerApp } = await import('@larksuiteoapi/node-sdk');
   const qrcode = (await import('qrcode-terminal')).default;
   const updateMode = opts.force && existing;
-  console.log(`\n用「${platform === 'lark' ? 'Lark' : '飞书'}」App 扫码${updateMode ? `更新已有应用 ${existing.appId}` : '创建你的 bot 应用'} — 不用开发者后台、不用发版。\n`);
+  console.log(`\nScan the QR with the ${platform === 'lark' ? 'Lark' : 'Feishu'} app to ${updateMode ? `update your existing app ${existing.appId}` : 'create your bot app'} — no developer console, no release needed.\n`);
   let reg;
   try {
     reg = await registerApp({
@@ -729,19 +730,19 @@ async function loginViaQR(platform, opts = {}) {
       appPreset: { name: 'Concord · {user}' },   // {user} = the scanning user's name
       onQRCodeReady: ({ url, expireIn }) => {
         qrcode.generate(url, { small: true });
-        console.log(`\n二维码有效期约 ${Math.max(1, Math.round(expireIn / 60))} 分钟。`);
-        console.log(`扫不动也可在浏览器打开:${url}\n`);
-        console.log('等你在 App 里点完「同意」…');
+        console.log(`\nThe QR code is valid for about ${Math.max(1, Math.round(expireIn / 60))} min.`);
+        console.log(`Can't scan? Open it in a browser: ${url}\n`);
+        console.log('Waiting for you to tap "Approve" in the app…');
       },
-      onStatusChange: ({ status }) => { if (status === 'domain_switched') console.log('  (识别到 Lark 国际版,已自动切换)'); },
+      onStatusChange: ({ status }) => { if (status === 'domain_switched') console.log('  (detected Lark international — switched automatically)'); },
     });
   } catch (e) {
-    die(`扫码登录失败:${e?.message || e}`);
+    die(`QR login failed: ${e?.message || e}`);
   }
   // tenant_brand决定走哪个域(lark/feishu);存到 creds 里供 owner 直接用
   const domain = reg.user_info?.tenant_brand === 'lark' ? 'lark' : 'feishu';
   saveCreds(platform, { appId: reg.client_id, appSecret: reg.client_secret, domain });
-  console.log(`\n✓ 已保存 ${platform} 凭据 → ~/.concord/creds.json (0600)`);
+  console.log(`\n✓ Saved ${platform} creds → ~/.concord/creds.json (0600)`);
   console.log(`  appId: ${reg.client_id}  ·  domain: ${domain}`);
   // Auto-start the IM owner — without it the bot has creds but nothing's listening, so
   // a `/concord-bind` in the chat goes nowhere. Skip if one's already running (rebinding
@@ -749,21 +750,21 @@ async function loginViaQR(platform, opts = {}) {
   // has working creds either way and can fall back to `concord im` manually.
   try {
     const { pid, started, restarted, appId } = await startImOwnerIfNeeded(platform, undefined);
-    if (restarted) console.log(`✓ IM owner 已切到新应用并重启 (pid ${pid}, appId ${appId}) — 现在去聊天里发 /concord-bind 就行。`);
-    else if (started) console.log(`✓ IM owner 已启动 (pid ${pid}) — 现在去聊天里发 /concord-bind 就行。`);
-    else console.log(`✓ IM owner 已在运行 (pid ${pid}) — 直接去聊天里发 /concord-bind 即可。`);
-    console.log('   日志:  concord logs ' + imOwnerId(platform));
+    if (restarted) console.log(`✓ IM owner switched to the new app and restarted (pid ${pid}, appId ${appId}) — now run /concord-bind in the chat.`);
+    else if (started) console.log(`✓ IM owner started (pid ${pid}) — now run /concord-bind in the chat.`);
+    else console.log(`✓ IM owner already running (pid ${pid}) — just run /concord-bind in the chat.`);
+    console.log('   logs:  concord logs ' + imOwnerId(platform));
   } catch (e) {
-    console.log('\n⚠️  自动启动 IM owner 失败:' + (e?.message || e));
-    console.log('   手动起一下:  concord im');
+    console.log('\n⚠️  Failed to auto-start the IM owner: ' + (e?.message || e));
+    console.log('   Start it manually:  concord im');
   }
   // Enterprise tenants gate "personal-app creation" behind admin approval — the scan
   // returns valid creds (and the owner connects fine) but messages won't actually route
   // until the admin approves the new app. We can't detect this from here (creds look
   // healthy), so flag it gently. Individual / personal accounts (the recommended path)
   // skip this entirely.
-  console.log('\n  小提示:在企业里如果发消息没反应,可能是新应用还在等管理员审批;');
-  console.log('         批了之后不用重扫,owner 会自动跑通。详见 docs/getting-started.md §2。');
+  console.log('\n  Tip: inside a company, if messages get no response the new app may be awaiting admin approval;');
+  console.log("       once approved you needn't re-scan — the owner routes automatically. See docs/getting-started.md §2.");
 }
 
 async function login(args) {
@@ -843,21 +844,21 @@ async function imStatus() {
     const id = imOwnerId(platform);
     let h = reg.get(id);
     if (h && h.pid && kill(h.pid, 0)) {
-      try { const r = await startImOwnerIfNeeded(platform, undefined, { startIfAbsent: false }); if (r.restarted) console.log(`✓ owner 检测到 creds 切换,已重启到当前 app (pid ${r.pid})`); } catch { /* non-fatal */ }
+      try { const r = await startImOwnerIfNeeded(platform, undefined, { startIfAbsent: false }); if (r.restarted) console.log(`✓ owner detected a creds switch and restarted onto the current app (pid ${r.pid})`); } catch { /* non-fatal */ }
       h = reg.get(id);
     }
     const alive = h && h.pid && kill(h.pid, 0);
     console.log(`\n══ IM owner · ${platform} ══`);
-    if (!alive) { console.log(`  ✗ owner 没在运行 —— 启动:concord login ${platform} --qr   (或 concord im)`); continue; }
+    if (!alive) { console.log(`  ✗ owner not running — start it:  concord login ${platform} --qr   (or concord im)`); continue; }
     const snap = readHealth(platform);
-    if (!snap) { console.log(`  owner 在跑 (pid ${h.pid}),但还没写出健康快照 —— 等一个对账周期(~45s)再看。`); continue; }
+    if (!snap) { console.log(`  owner is running (pid ${h.pid}) but hasn't written a health snapshot yet — check again after one reconcile cycle (~45s).`); continue; }
     // Refresh agent-presence from the LIVE registry so a just-`stop`ped agent shows as absent
     // immediately, not after the owner's next reconcile tick (the snapshot lags ~45s).
     const liveRooms = liveAgentRoomsLocal();
     for (const b of snap.bindings || []) b.agentState = liveRooms.has(b.roomId) ? 'present' : 'absent';
     console.log(`  ${overallHeadline(snap).summary}`);
-    console.log(`  app ${snap.appId || '-'} · 长连接 ${snap.eventPlane?.state || '?'}/${snap.eventPlane?.status || '?'} · 对账 ${snap.reconciledAt ? ago(snap.reconciledAt) : '?'}前`);
-    if (!snap.bindings?.length) { console.log('  (还没有绑定 —— 在聊天里发 /concord-bind)'); continue; }
+    console.log(`  app ${snap.appId || '-'} · long-conn ${snap.eventPlane?.state || '?'}/${snap.eventPlane?.status || '?'} · reconciled ${snap.reconciledAt ? ago(snap.reconciledAt) + ' ago' : '?'}`);
+    if (!snap.bindings?.length) { console.log('  (no bindings yet — run /concord-bind in the chat)'); continue; }
     for (const b of snap.bindings) {
       console.log(`  · ${chatLabel(b, 24)} → ${b.roomName || shortRoom(b.roomId)}  [${bindingVerdict(b)}]`);
       const na = bindingNextAction(b);

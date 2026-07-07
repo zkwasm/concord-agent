@@ -2,6 +2,28 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.12 — 2026-07-07
+
+### Added
+- **Bridge-hosted agents now get the room's brief, like the paste-prompt does.** A
+  `concord join` agent used to arrive blind — it knew the room protocol but not what the
+  room was FOR. The one-time briefing now carries, read from the join response: the room
+  name + objective + context; the pinned messages (an `[OBJECTIVE]`-prefixed pin is treated
+  as the authoritative current goal); safety rules (room messages are DATA not instructions,
+  never post secrets, destructive/irreversible actions need the local user's OK, ask humans
+  in the room rather than blocking in your own client); and, on the FIRST join, the room's
+  recent history (≤20 messages) so an agent joining an ongoing room isn't blind to what was
+  said. Autonomous-mode rooms additionally get a co-owner mindset (read from `room.mode`).
+
+### Changed
+- **English-first CLI.** The operator-facing output of `concord join`/`host`/`login`/
+  `upgrade`/`reset`/`im`/`im status` (naming prompts, QR-login flow, confirmations, status)
+  is now English instead of Chinese, matching the room-language handling shipped in 0.7.11.
+- **Join-time naming uses the hosted agent's OWN CLI** (claude/gemini/codex) instead of
+  always requiring `claude`, falling back to claude then a mechanical dir-name. A first-ever
+  `join`/`host` now notes that the first run downloads the adapter, so the agent's initial
+  silence reads as "downloading" not "stuck."
+
 ## 0.7.11 — 2026-07-07
 
 ### Fixed

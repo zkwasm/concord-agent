@@ -124,15 +124,22 @@ export function fallbackCandidates(dir, taken = []) {
   return out;
 }
 
-// One-off headless naming call. Uses the local `claude` CLI in print mode —
-// vendor-neutral enough (naming needs no tools) and already a prerequisite on
-// most machines; missing binary / non-zero exit / timeout all resolve to ''.
-export function runHeadlessClaude(prompt, { timeoutMs = 30000, spawnImpl = spawn } = {}) {
+// Non-interactive ("print") invocation per agent CLI for the one-off naming call.
+// Naming needs no tools, so ANY installed agent CLI works — we prefer the one being
+// hosted so a codex/gemini user need not ALSO install claude. Best-effort flags;
+// unknown/failed → fall back to claude, then to the mechanical dir-name.
+const HEADLESS_ARGS = {
+  claude: (p) => ['-p', p],
+  gemini: (p) => ['-p', p],
+  codex: (p) => ['exec', p],
+};
+// Spawn `cmd args`, capture stdout; missing binary / non-zero exit / timeout → ''.
+function spawnCapture(cmd, args, { timeoutMs = 30000, spawnImpl = spawn } = {}) {
   return new Promise((resolve) => {
     let done = false;
     const finish = (v) => { if (!done) { done = true; resolve(v); } };
     let child;
-    try { child = spawnImpl('claude', ['-p', prompt], { stdio: ['ignore', 'pipe', 'ignore'] }); }
+    try { child = spawnImpl(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'] }); }
     catch { return finish(''); }
     let out = '';
     const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } finish(''); }, timeoutMs);
@@ -141,23 +148,39 @@ export function runHeadlessClaude(prompt, { timeoutMs = 30000, spawnImpl = spawn
     child.on('close', (code) => { clearTimeout(timer); finish(code === 0 ? out : ''); });
   });
 }
+// Name via the local `claude` CLI. Kept as its own export for direct tests / callers.
+export function runHeadlessClaude(prompt, opts = {}) {
+  return spawnCapture('claude', ['-p', prompt], opts);
+}
+// Name via a given agent's own CLI (unknown agent → claude's invocation).
+export function runHeadlessAgent(agentType, prompt, opts = {}) {
+  const cmd = HEADLESS_ARGS[agentType] ? agentType : 'claude';
+  return spawnCapture(cmd, HEADLESS_ARGS[cmd](prompt), opts);
+}
 
 // Orchestrator, grounded-first: ① the room template's own role list (untaken
 // entries verbatim — deterministic, zero LLM); ② only when the template gives
 // nothing, a one-off headless call grounded on the room's purpose/context;
 // ③ dir-name fallback so the picker never comes up empty.
-export async function suggestNames({ dir, agentType, url, roomId, fetchImpl, runHeadless = runHeadlessClaude, log = () => {} } = {}) {
+export async function suggestNames({ dir, agentType, url, roomId, fetchImpl, runHeadless = null, log = () => {} } = {}) {
+  // Default namer: the hosted agent's own CLI first, then claude as a fallback (so a
+  // codex/gemini box without claude still gets grounded names). Tests inject their own.
+  const headless = runHeadless || (async (prompt) => {
+    let out = await runHeadlessAgent(agentType, prompt);
+    if (!out && agentType && agentType !== 'claude') out = await runHeadlessClaude(prompt);
+    return out;
+  });
   const info = await gatherRoomInfo(url, roomId, { fetchImpl });
   const taken = info.agents || [];
   const lower = new Set(taken.map((t) => String(t).trim().toLowerCase()));
   const templateRoles = extractTemplateRoles(info.context).filter((r) => !lower.has(r.toLowerCase()));
   if (templateRoles.length) {
-    log(`▸ 房间模板定义了参与者角色${info.roomName ? `(房间「${info.roomName}」)` : ''}——未被占用的:${templateRoles.join(', ')}`);
+    log(`▸ The room template defines participant roles${info.roomName ? ` (room "${info.roomName}")` : ''} — untaken: ${templateRoles.join(', ')}`);
     const candidates = [...templateRoles, ...fallbackCandidates(dir, [...taken, ...templateRoles])].slice(0, 5);
     return { candidates, info, source: 'template' };
   }
-  log(`▸ 让一个一次性 headless agent 根据房间信息起名…${info.roomName ? `(房间「${info.roomName}」${taken.length ? ` · 在场: ${taken.join(', ')}` : ''})` : ''}`);
-  const raw = await runHeadless(namingPrompt({ dir, agentType, ...info }));
+  log(`▸ Asking a one-off headless agent to suggest a name from the room info…${info.roomName ? ` (room "${info.roomName}"${taken.length ? ` · present: ${taken.join(', ')}` : ''})` : ''}`);
+  const raw = await headless(namingPrompt({ dir, agentType, ...info }));
   const llm = parseCandidates(raw, { taken });
   const fb = fallbackCandidates(dir, [...taken, ...llm]);
   const candidates = [...llm, ...fb].slice(0, 5);
