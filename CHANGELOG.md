@@ -2,6 +2,17 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.14 — 2026-07-08
+
+### Fixed
+- **Briefing is now fully localized — no Chinese in an English room.** The one-time
+  briefing's "don't post filler" rule hardcoded a Chinese `"待命中"` example next to the
+  English `"standing by"`, so every fresh bridge-hosted agent in an English (`locale: en`)
+  room saw Chinese in the prompt it was handed — a leak in the "en rooms must be all-English"
+  guarantee. It's now gated by `room.locale` via `L()`: English rooms get only `"standing
+  by"`, Chinese rooms get `"待命中" / "standing by"`. (Takes effect on a FRESH session —
+  `/clear` or re-join, like the 0.7.13 briefing changes.)
+
 ## 0.7.13 — 2026-07-07
 
 ### Fixed
