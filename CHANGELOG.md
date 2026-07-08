@@ -2,6 +2,15 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.13 — 2026-07-07
+
+### Fixed
+- **Join-time naming: no ghost names, right language.** The naming flow read the room's
+  ALL-TIME sender list, so it treated departed "-N" identities as present and suggested
+  things like "agent-one-3"; and it could propose role names in the wrong language. It now
+  uses the room's ONLINE roster (paired with the im-for-agents `/agents` change) and writes
+  role names in the room's actual language, read from `room.locale` via `/info`.
+
 ## 0.7.12 — 2026-07-07
 
 ### Added

@@ -12,7 +12,7 @@ import { basename } from 'node:path';
 
 // Best-effort room context via the agent API (the room id is the bearer token).
 export async function gatherRoomInfo(url, roomId, { fetchImpl = globalThis.fetch, timeoutMs = 4000 } = {}) {
-  const out = { roomName: '', purpose: '', context: '', agents: [] };
+  const out = { roomName: '', purpose: '', context: '', agents: [], locale: 'en' };
   if (!url || !roomId) return out;
   const base = `${url.replace(/\/$/, '')}/agent/rooms/${roomId}`;
   const get = async (path) => {
@@ -23,7 +23,7 @@ export async function gatherRoomInfo(url, roomId, { fetchImpl = globalThis.fetch
     finally { clearTimeout(t); }
   };
   const [info, ag] = await Promise.all([get('/info'), get('/agents')]);
-  if (info) { out.roomName = info.name || ''; out.purpose = info.purpose || ''; out.context = info.context || ''; }
+  if (info) { out.roomName = info.name || ''; out.purpose = info.purpose || ''; out.context = info.context || ''; out.locale = info.locale || 'en'; }
   if (ag && Array.isArray(ag.agents)) out.agents = ag.agents;
   return out;
 }
@@ -56,7 +56,7 @@ export function extractTemplateRoles(context) {
 // web paste-prompt: "ask the user what role you should play … use it as your
 // sender name and persona throughout"). So the headless call proposes ROLES that
 // fit the collaboration objective — not decorative labels.
-export function namingPrompt({ dir, agentType, roomName, purpose, context, agents }) {
+export function namingPrompt({ dir, agentType, roomName, purpose, context, agents, locale = 'en' }) {
   const lines = [
     'A new coding agent is about to join a collaboration room. Its sender name doubles as its ROLE',
     'and persona in the room — it is how humans decide who to @ and who owns which task.',
@@ -79,8 +79,10 @@ export function namingPrompt({ dir, agentType, roomName, purpose, context, agent
     '  never reuse or collide with an existing name.',
     '- GROUND every candidate in the provided objective / context / project directory — do NOT',
     '  invent domains or duties they do not imply.',
-    '- Write role names in the same language as the collaboration objective.',
-    '- Each ≤ 16 characters, no spaces (hyphens ok). Concrete beats generic ("支付-评审" beats "helper").',
+    locale === 'zh'
+      ? '- Write the role names in Chinese — this room works in Chinese.'
+      : '- Write the role names in English — this room works in English.',
+    `- Each ≤ 16 characters, no spaces (hyphens ok). Concrete beats generic (${locale === 'zh' ? '"支付-评审"' : '"payment-reviewer"'} beats "helper").`,
     '- Output ONLY a JSON array of 4 strings. No prose, no markdown fence.',
   );
   return lines.join('\n');
