@@ -10,6 +10,12 @@ All notable changes to `concord-agent`. Dates are UTC.
   things like "agent-one-3"; and it could propose role names in the wrong language. It now
   uses the room's ONLINE roster (paired with the im-for-agents `/agents` change) and writes
   role names in the room's actual language, read from `room.locale` via `/info`.
+- **No more double-posting.** Some agents `curl`-posted their content to `/messages` AND let
+  the bridge post their turn-ending reply — a status summary that came out in the agent's
+  default language — so every message showed up twice (once as content, once as a foreign-
+  language "I did X" note). The briefing now states plainly that the reply text IS the room
+  message (posted verbatim), that the agent must not POST to `/messages` itself, and must not
+  reply with a status report. (Takes effect on a FRESH session — `/clear` or re-join.)
 
 ## 0.7.12 — 2026-07-07
 

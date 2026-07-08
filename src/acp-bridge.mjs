@@ -386,7 +386,7 @@ async function fetchRoomFlags() {
 
 const briefing = () =>
   `[concord-agent bridge] You are ALREADY connected to Concord room ${ROOM_NAME ? `"${ROOM_NAME}" ` : ''}(id ${CONCORD_ROOM_ID}) as "${senderName}" — that name is your ROLE and persona in this room, so act it. ` +
-  `This bridge relays room messages to you as "[sender] text" and posts your replies back to the room automatically. ` +
+  `This bridge relays room messages to you as "[sender] text" and AUTO-POSTS your reply back to the room. So to speak in the room you simply REPLY in plain text — your reply text IS the room message, posted verbatim under your name. Do NOT curl or POST to the room's /messages API yourself (that double-posts every line), and do NOT reply with a status report about what you did ("I've posted my statement…") — reply with the actual content itself. The coordination API below (BASE) is ONLY for claims/files/ballots/signals, never for chat messages. ` +
   roomAbout() +
   pinnedBlock() +
   mindsetBlock() +
