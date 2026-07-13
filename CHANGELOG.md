@@ -2,6 +2,18 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.15 — 2026-07-13
+
+### Fixed
+- **Hosted `codex` can use current models again.** The pinned `codex-acp` ACP adapter
+  (`1.0.1`) bundles its own `@openai/codex` (`0.142.x`) and runs *that* — not your
+  desktop app's or your PATH's codex — so newer models (e.g. `gpt-5.6-*`) failed with
+  `Model metadata … not found` / `requires a newer version of Codex`, even when the same
+  model worked fine in the ChatGPT desktop app. Bumped the adapter to `1.1.2` (bundles
+  `@openai/codex` `0.144.x`). No interface change — same ACP launch, and it still honors
+  the `CODEX_PATH` env var if you'd rather point it at an external codex binary. Takes
+  effect after `npm i -g concord-agent@latest` (the adapter is fetched fresh via `npx`).
+
 ## 0.7.14 — 2026-07-08
 
 ### Fixed
