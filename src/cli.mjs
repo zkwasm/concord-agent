@@ -140,3 +140,61 @@ export function isFiller(content) {
   if (s === '') return true;                                                     // bare NOOP (± punctuation)
   return s.length <= 16 && /^(待\s*命|standing\s*by)/i.test(s);                  // short line that OPENS with a standing-by phrase
 }
+
+// A TRANSIENT turn failure: the provider throttled us, is overloaded, or the
+// transport blipped. The same prompt typically succeeds moments later, so these
+// must be retried rather than reported as a dead end — a dropped turn costs the
+// message that triggered it AND leaves an un-addressed note behind, which peers
+// classify as ambient chatter, so the room falls silent for good.
+// Our own stuck-turn cancellation is deliberately excluded: that turn already ran
+// past the ceiling, and re-running it would just burn the ceiling again.
+const TRANSIENT_TURN_RE = /rate.?limit|temporarily limiting|overloaded?|too many requests|\b(429|502|503|504|529)\b|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket hang up|fetch failed|network error/i;
+export function isTransientTurnError(e) {
+  if (!e) return false;
+  if (e.code === 'TURN_TIMEOUT') return false;     // our own per-turn ceiling, not the provider's
+  return TRANSIENT_TURN_RE.test(String(e.message ?? e));
+}
+
+// A room note that addresses NOBODY wakes nobody: peers classify an un-@'d agent
+// post as ambient context, never a turn. So a failure note or a command result
+// must be addressed back at whoever triggered it, or the exchange ends in silence.
+export function mentioning(name, text, selfName) {
+  const n = String(name || '').trim();
+  return !n || n === String(selfName || '').trim() ? text : `@${n} ${text}`;
+}
+
+// …but an addressed failure note WAKES its addressee, and a peer that is failing
+// too answers with its own addressed failure note: a two-agent error ping-pong,
+// the same echo-loop shape 0.7.9 removed. This gate addresses a peer at most ONCE
+// per consecutive-failure streak — a repeat goes out un-addressed (nobody woken,
+// the human still sees it) — and any successful turn clears the streak.
+// A turn's input = the batched inbox (missed context, if any) prepended to the
+// message that actually woke the agent.
+//
+// EXCEPT for a passthrough slash command, which must reach the adapter with "/" at
+// offset 0 — the adapter only treats a prompt as a command when the text ITSELF
+// starts with one. Prepending the inbox silently degrades `/compact` into ordinary
+// chat (the agent then TALKS about compacting instead of compacting), and in a
+// multi-agent room the inbox is almost never empty — so the command would fail
+// precisely where it is needed most. Verified live: two agents, same `/compact`,
+// the one with a non-empty inbox never ran it.
+export function composeTurnText(item, inbox = [], dropped = 0, locale = 'en') {
+  if (item?.slash || !inbox.length) return item.text;
+  const head = (locale === 'zh'
+    ? `(以下 ${inbox.length} 条是你未被唤醒期间的房间消息,按时间顺序,仅供同步上下文,无需逐条回应${dropped ? `;更早 ${dropped} 条已省略` : ''}:)\n`
+    : `(The following ${inbox.length} room message(s) arrived while you were away, in order — context only, no need to reply to each${dropped ? `; ${dropped} earlier one(s) omitted` : ''}:)\n`)
+    + inbox.map((x) => `[${x.sender}] ${x.content}`).join('\n') + '\n\n';
+  return head + item.text;
+}
+
+export function createFailureGate() {
+  let last = null;
+  return {
+    addressee(sender) {
+      const repeat = Boolean(sender) && sender === last;
+      last = sender ?? null;
+      return repeat ? null : sender;
+    },
+    reset() { last = null; },
+  };
+}

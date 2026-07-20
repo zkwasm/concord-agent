@@ -15,7 +15,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openStore } from './store.mjs';
 import { toolToProgress, toolDetail } from './render.mjs';
-import { resolveConfig, usage, classifyInbound, isBareHumanBroadcast, isFiller } from './cli.mjs';
+import { resolveConfig, usage, classifyInbound, isBareHumanBroadcast, isFiller, isTransientTurnError, mentioning, createFailureGate, composeTurnText } from './cli.mjs';
 import { overBudget, usageReport, budgetExceededNote } from './budget.mjs';
 import { obtainRoomId } from './handoff.mjs';
 import { createEngine } from './engine.mjs';
@@ -462,20 +462,15 @@ function deferInbound(sender, content) {
   console.log(`· deferred | ${sender}: ${String(content).slice(0, 60)}`);
 }
 
-// A turn's input = the batched inbox (missed context, if any) prepended to the
-// message that actually woke the agent.
+// Text composition (incl. the passthrough-slash rule) lives in cli.mjs so it can be
+// tested; the store side effects — draining the inbox exactly once — stay here.
 function composeTurn(item) {
+  if (item.slash) return composeTurnText(item);            // inbox deliberately left for the next real turn
   const inbox = store.getInbox(CONCORD_ROOM_ID);
-  let head = '';
-  if (inbox.length) {
-    const dropped = store.getInboxDropped(CONCORD_ROOM_ID);
-    head = L(
-      `(The following ${inbox.length} room message(s) arrived while you were away, in order — context only, no need to reply to each${dropped ? `; ${dropped} earlier one(s) omitted` : ''}:)\n`,
-      `(以下 ${inbox.length} 条是你未被唤醒期间的房间消息,按时间顺序,仅供同步上下文,无需逐条回应${dropped ? `;更早 ${dropped} 条已省略` : ''}:)\n`)
-      + inbox.map((x) => `[${x.sender}] ${x.content}`).join('\n') + '\n\n';
-    store.clearInbox(CONCORD_ROOM_ID);
-  }
-  return head + item.text;
+  if (!inbox.length) return item.text;
+  const text = composeTurnText(item, inbox, store.getInboxDropped(CONCORD_ROOM_ID), ROOM_LOCALE);
+  store.clearInbox(CONCORD_ROOM_ID);
+  return text;
 }
 
 // Whether the lifetime fresh-token cap is hit — so a runaway agent can't burn
@@ -585,6 +580,33 @@ function arbEligible(m) {
     && !String(m.content || '').trim().startsWith('/') && !pendingElicit && !budgetBlocked();
 }
 
+// Address a note back at whoever triggered the turn — that is the one participant
+// we know is waiting on it. (Reviving a floor that simply went idle is a room-shape
+// concern and belongs to a moderator, not here.) `failGate` keeps a streak of
+// failures from turning those notes into a two-agent ping-pong; see cli.mjs.
+const mention = (name, text) => mentioning(name, text, senderName);
+const failGate = createFailureGate();
+
+// Transient upstream failures (throttling, overload, transport blips) get retried
+// with exponential backoff before we ever call a turn dead. Retries reuse the
+// ALREADY-COMPOSED payload — composeTurn drains the inbox, so re-composing would
+// silently lose the missed-context block on the second attempt.
+const RETRY_MAX = Math.max(0, Number(process.env.ACP_RETRY_MAX ?? 3));
+const RETRY_BASE_MS = Math.max(0, Number(process.env.ACP_RETRY_BASE_MS ?? 10000));
+async function runTurnWithRetry(payload) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await runTurn(payload); }
+    catch (e) {
+      if (attempt >= RETRY_MAX || !isTransientTurnError(e)) throw e;
+      const waitMs = RETRY_BASE_MS * 2 ** attempt;
+      console.warn(`· transient turn failure (${attempt + 1}/${RETRY_MAX}): ${String(e?.message || e).slice(0, 120)} → retry in ${Math.round(waitMs / 1000)}s`);
+      store.setActivity('working', `retrying ${attempt + 1}/${RETRY_MAX}`);
+      await new Promise((r) => setTimeout(r, waitMs));
+      if (!engine || engine.dead()) await ensureEngine();   // a blip that also killed the adapter must not doom every retry
+    }
+  }
+}
+
 async function drain() {
   if (busy || pending.length === 0) return;
   busy = true;
@@ -599,14 +621,18 @@ async function drain() {
         try { await ensureEngine(); }
         catch (e) { console.error('engine restart failed:', e.message); await out(L(`⚠️ The agent can't start right now (${String(e.message).slice(0, 120)}); please send it again shortly.`, `⚠️ agent 暂时起不来(${String(e.message).slice(0, 120)}),稍后再发一次。`), item.imChat).catch(() => {}); break; }
       }
-      pending.shift();
       currentImChat = item.imChat;                             // route this turn's progress + reply to its IM chat (if any)
       const label = item.text;
       console.log(`\n▶ turn start  ·  ${label.slice(0, 80)}`);
       store.setActivity('working', label.replace(/^\[[^\]]*\]\s*/, '').slice(0, 60));   // surface to `concord list`/`status`
+      // Composed once, OUTSIDE the retry: composeTurn drains the inbox, so every
+      // attempt must replay this exact payload. The item leaves the queue only in
+      // `finally` — a turn that is still being retried must not look consumed.
+      const payload = composeTurn(item);
       try {
-        const { reply, usage, tools } = await runTurn(composeTurn(item));
+        const { reply, usage, tools } = await runTurnWithRetry(payload);
         recreateTimes = [];                                    // a clean turn means the engine recovered → reset the crash-loop guard
+        failGate.reset();                                       // streak broken → the next failure may address a peer again
         store.addUsage(CONCORD_ROOM_ID, usage.fresh, usage.cached);
         maybeBudgetWarn();                                     // surface 80%-of-budget before the cap pauses us
         // The agent has a right to SILENCE: a NOOP — or the "待命中" filler agents
@@ -615,21 +641,28 @@ async function drain() {
         // standing by. A turn that DID work but ended text-less still confirms with
         // ✓ (Claude Code sometimes puts the conclusion in a summary the adapter drops).
         const txt = reply.trim();
+        // A slash command's result answers a specific person, so address it back —
+        // otherwise "Compacting completed." lands as ambient chatter and the room
+        // stops dead right after the very command meant to keep it going.
         if (isFiller(txt)) console.log('■ NOOP/filler — nothing to say, staying silent');
-        else if (txt) await out(txt);                          // agent's full reply -> room + IM chat
-        else if (tools > 0) await out(L('✓ done', '✓ 完成'));
+        else if (txt) await out(item.slash ? mention(item.sender, txt) : txt);   // agent's full reply -> room + IM chat
+        else if (tools > 0) await out(mention(item.sender, L('✓ done', '✓ 完成')));
         else console.log('■ empty reply, no tools — staying silent');
       } catch (e) {
         // A mid-turn ACP failure must NOT crash the host (the #1 review finding).
         // Surface it and keep the bridge alive; the next iteration rebuilds the engine.
+        // Transient causes were already retried by runTurnWithRetry, so reaching
+        // here means we genuinely gave up — say so, and say it TO someone.
         console.error('turn failed:', e.message);
+        const to = failGate.addressee(item.sender);
         if (e && e.code === 'TURN_TIMEOUT') {
           const hrs = Math.round((parseInt(process.env.ACP_TURN_TIMEOUT ?? '21600', 10) || 21600) / 3600);
-          await out(L(`⚠️ This turn ran past ${hrs}h without finishing and was cancelled as stuck. Send it again to continue; raise the ceiling with ACP_TURN_TIMEOUT (0 = no limit).`, `⚠️ 这轮超过 ${hrs} 小时仍未结束,被当作卡死取消了。可以再发一次继续;要放宽就用 ACP_TURN_TIMEOUT 调大(0 = 不限)。`)).catch(() => {});
+          await out(mention(to, L(`⚠️ This turn ran past ${hrs}h without finishing and was cancelled as stuck. Send it again to continue; raise the ceiling with ACP_TURN_TIMEOUT (0 = no limit).`, `⚠️ 这轮超过 ${hrs} 小时仍未结束,被当作卡死取消了。可以再发一次继续;要放宽就用 ACP_TURN_TIMEOUT 调大(0 = 不限)。`))).catch(() => {});
         } else {
-          await out(L(`⚠️ This one didn't go through (${String(e.message).slice(0, 120)}); you can send it again.`, `⚠️ 这条没处理成功(${String(e.message).slice(0, 120)}),可以再发一次。`)).catch(() => {});
+          await out(mention(to, L(`⚠️ This one didn't go through after ${RETRY_MAX} retries (${String(e.message).slice(0, 120)}); you can send it again.`, `⚠️ 这条重试 ${RETRY_MAX} 次后仍未处理成功(${String(e.message).slice(0, 120)}),可以再发一次。`))).catch(() => {});
         }
       } finally {
+        pending.shift();          // consumed only now — a turn still being retried must not look done
         currentImChat = null;
       }
     }
@@ -709,7 +742,9 @@ async function handleInbound({ text, sender, imChat = null, senderType = 'human'
   console.log(`→ agent | ${sender}: ${content}`);
   // Allowlisted session-control slash → verbatim (no prefix) so the adapter executes it; else attributed chat.
   const isSlash = PASSTHROUGH_SLASH.has(content.split(/\s+/, 1)[0]);
-  pending.push({ text: isSlash ? content : `[${sender}] ${content}`, imChat });
+  // `slash` keeps composeTurn from prefixing the inbox (which would un-command it);
+  // `sender` lets a failure note / command result be addressed back at whoever asked.
+  pending.push({ text: isSlash ? content : `[${sender}] ${content}`, imChat, slash: isSlash, sender });
   drain();
 }
 

@@ -2,6 +2,33 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.16 — 2026-07-20
+
+### Fixed
+- **A provider hiccup no longer kills a room for good.** A rate-limited / overloaded
+  turn was treated as a permanent failure: the message that triggered it was dropped
+  before the attempt (`pending.shift()` ran ahead of the try), and the `⚠️ didn't go
+  through` note went out addressing **nobody** — which every peer classifies as ambient
+  chatter, never a turn. So one transient upstream blip left a multi-agent room silent
+  until a human noticed and re-sent by hand. Now: transient failures (throttling,
+  overload, 429/502/503/504/529, transport resets) are **retried with exponential
+  backoff** (`ACP_RETRY_MAX`, default 3; `ACP_RETRY_BASE_MS`, default 10000) against the
+  already-composed payload, the queue entry is consumed only once the turn truly settles,
+  and any note that *does* go out is addressed back at whoever triggered the turn. Our own
+  stuck-turn cancellation stays non-retryable. To keep two failing agents from trading
+  addressed error notes forever (the echo-loop shape 0.7.9 removed), a peer is addressed
+  at most once per consecutive-failure streak; a successful turn clears the streak.
+- **In-room `/compact` and `/context` actually run again.** Passthrough slash commands are
+  sent verbatim so the adapter sees `/` at offset 0 — but `composeTurn` prepended the
+  batched inbox whenever one had accumulated, pushing the `/` off the front. The adapter
+  then read it as ordinary prompt text and the agent would *talk about* compacting instead
+  of compacting. In a multi-agent room the inbox is almost never empty, so the command
+  failed exactly where it was needed most. Verified live: two agents, one `/compact`, and
+  only the one with an empty inbox ran it. The inbox is now left intact for the next real
+  turn, so skipping it costs no context.
+- **A tool-only turn's `✓ done` is addressed too**, so "I finished what you asked" reaches
+  the peer that asked instead of dissolving into ambient chatter.
+
 ## 0.7.15 — 2026-07-13
 
 ### Fixed
