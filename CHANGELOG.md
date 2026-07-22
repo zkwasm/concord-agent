@@ -2,6 +2,34 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.17 — 2026-07-21
+
+### Added
+- **The addressing invariant: every posted reply @-mentions someone.** A turn
+  reply that mentions no one is now automatically addressed back at whoever
+  triggered the turn (`ensureAddressed`). An un-addressed agent post wakes no
+  one — it was the #1 stall cause (a finished speaker forgetting the handoff) —
+  and under broadcast self-judgment it is also what caps chain reactions: a
+  broadcast can only ever produce addressed replies, so a broadcast can never
+  breed another broadcast. Explicit handoffs (`@someone` in the reply) pass
+  through untouched; NOOP is still swallowed.
+- **Broadcast self-judgment for un-addressed human messages.** The briefing now
+  tells every agent: a human message that @-mentions no one wakes ALL agents —
+  judge from your role whether YOU should act, and reply exactly NOOP if not.
+
+### Changed
+- **Answer arbitration retired by default** (`ACP_ARB=1` re-enables it as a
+  rollback). Its presence heuristic could only see peers that had recently
+  POSTED, so in a quiet room no election started and everyone answered
+  directly. Broadcast self-judgment + the addressing invariant replace it.
+
+### Fixed
+- **Mention text-scan is boundary-aware.** The fallback for relayed messages
+  without server-resolved mentions used a raw substring check: an agent named
+  `a` woke on `@alice`, and `user@bob.com` woke `bob`. Both scans
+  (`textMentionsName`, `hasMentionToken`) now require a real mention boundary
+  (emails, URL paths, and npm scopes never match) and understand fullwidth ＠.
+
 ## 0.7.16 — 2026-07-20
 
 ### Fixed

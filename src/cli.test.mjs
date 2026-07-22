@@ -129,3 +129,59 @@ test('resolveConfig: token budget is a CLI param (flag > env > unset)', () => {
   // unset → null (unlimited)
   assert.equal(resolveConfig(['claude'], {}).budget, null);
 });
+
+// ── 0.7.17: boundary-aware mention scan + the addressing invariant ──────────
+
+test('textMentionsName: boundary-aware — emails, URLs and substrings never match', async () => {
+  const { textMentionsName } = await import('./cli.mjs');
+  // plain forms match
+  assert.equal(textMentionsName('@bob please', 'bob'), true);
+  assert.equal(textMentionsName('发给@bob看看', 'bob'), true);          // CJK before @ is a valid start
+  assert.equal(textMentionsName('＠框架审核者 看看', '框架审核者'), true); // fullwidth ＠ normalized
+  assert.equal(textMentionsName('@BOB check', 'bob'), true);            // case-insensitive
+  assert.equal(textMentionsName('ping @Tom Chen', 'Tom Chen'), true);   // spaces in name
+  // boundaries reject look-alikes
+  assert.equal(textMentionsName('email user@bob.com', 'bob'), false);   // email
+  assert.equal(textMentionsName('see x.com/@bob now', 'bob'), false);   // URL path
+  assert.equal(textMentionsName('@bobby hi', 'bob'), false);            // right boundary
+  assert.equal(textMentionsName('@alice look', 'a'), false);            // one-letter substring (old includes() bug)
+  assert.equal(textMentionsName('@@bob hi', 'bob'), false);             // doubled @
+  assert.equal(textMentionsName('anything', ''), false);
+});
+
+test('hasMentionToken: any well-formed mention start counts; emails/URLs do not', async () => {
+  const { hasMentionToken } = await import('./cli.mjs');
+  assert.equal(hasMentionToken('@alice look'), true);
+  assert.equal(hasMentionToken('结尾交棒 @评审'), true);
+  assert.equal(hasMentionToken('＠评审 看看'), true);
+  assert.equal(hasMentionToken('reach me at a@b.com'), false);
+  assert.equal(hasMentionToken('see x.com/@bob'), false);
+  assert.equal(hasMentionToken('@ alone with space after'), false);
+  assert.equal(hasMentionToken('no at sign here'), false);
+  assert.equal(hasMentionToken(''), false);
+});
+
+test('ensureAddressed: an un-addressed reply is addressed back at its trigger', async () => {
+  const { ensureAddressed } = await import('./cli.mjs');
+  // no @ in reply → @ the trigger sender
+  assert.equal(ensureAddressed('done, chapter posted', 'Tom', '评审'), '@Tom done, chapter posted');
+  // reply already @s someone (anyone) → untouched, explicit handoff wins
+  assert.equal(ensureAddressed('@alice your turn', 'Tom', '评审'), '@alice your turn');
+  // an email in the reply is NOT a mention → still gets addressed
+  assert.equal(ensureAddressed('sent to a@b.com', 'Tom', '评审'), '@Tom sent to a@b.com');
+  // trigger is myself → mentioning() no-ops (never self-@)
+  assert.equal(ensureAddressed('reflection note', '评审', '评审'), 'reflection note');
+  // no trigger (e.g. IM-relayed) → unchanged
+  assert.equal(ensureAddressed('hello', '', '评审'), 'hello');
+});
+
+test('classifyInbound fallback: boundary scan replaces raw includes()', async () => {
+  const { classifyInbound } = await import('./cli.mjs');
+  // an email containing my name must NOT wake me (relay path, no mentions field)
+  assert.equal(classifyInbound({ sender: 'Tom', senderType: 'human', content: 'send to user@bob.com please' }, 'bob'), 'wake');   // human broadcast → wake (not BECAUSE of the email)
+  assert.equal(classifyInbound({ sender: 'alice', senderType: 'agent', content: 'log sent to user@bob.com' }, 'bob'), 'defer');   // agent chatter with email → ambient, not a wake
+  // a one-letter name doesn't substring-wake on @alice
+  assert.equal(classifyInbound({ sender: 'x', senderType: 'agent', content: '@alice look' }, 'a'), 'defer');
+  // fullwidth ＠ wakes on the fallback path too
+  assert.equal(classifyInbound({ sender: 'x', senderType: 'agent', content: '＠评审 请看' }, '评审'), 'wake');
+});

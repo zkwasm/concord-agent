@@ -94,8 +94,8 @@ export function classifyInbound(m, selfName) {
     if (mentions.length) return 'defer';                      // addressed to someone else
   } else {
     const content = String(m.content || '');
-    if (selfName && content.includes(`@${selfName}`)) return 'wake';
-    if (/(^|\s)@\S{1,32}/.test(content)) return 'defer';      // @-ing someone that isn't me
+    if (textMentionsName(content, selfName)) return 'wake';
+    if (hasMentionToken(content)) return 'defer';             // @-ing someone that isn't me
   }
   // A pure standing-by / NOOP filler broadcast carries no content and no context;
   // dropping it (not even inboxing) is what stops an idle room from sustaining a
@@ -121,7 +121,7 @@ export function isBareHumanBroadcast(m, selfName) {
   if (m.sender === selfName) return false;
   const mentions = Array.isArray(m.mentions) ? m.mentions : null;
   if (mentions && mentions.length) return false;                 // addressed to someone
-  if (/(^|\s)@\S{1,32}/.test(String(m.content || ''))) return false;   // text-scan fallback for relays w/o mentions
+  if (hasMentionToken(m.content)) return false;                  // text-scan fallback for relays w/o mentions
   return true;
 }
 
@@ -161,6 +161,41 @@ export function isTransientTurnError(e) {
 export function mentioning(name, text, selfName) {
   const n = String(name || '').trim();
   return !n || n === String(selfName || '').trim() ? text : `@${n} ${text}`;
+}
+
+// An @ only starts a mention when the char before it couldn't belong to an email
+// local-part / URL path / npm scope — "user@bob.com" and "x.com/@bob" must not
+// wake bob, and a one-letter name must not substring-match inside "@alice".
+// Mirrors the server's parseMentions boundary; fullwidth ＠ (CJK IMEs) counts.
+const AT_LEFT = '(?<![A-Za-z0-9_.@+/\\-])';
+const normalizeAt = (s) => String(s == null ? '' : s).replace(/＠/g, '@');
+
+// Does the text @-mention this exact name (boundary-aware, case-insensitive)?
+// The text-scan fallback for relays that don't carry server-resolved mentions.
+export function textMentionsName(content, name) {
+  const n = String(name || '').trim();
+  if (!n) return false;
+  const esc = n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Right boundary bars a CONTINUING Latin word char ("@bobby" ≠ bob) but
+  // allows a following CJK char — Chinese runs on with no space ("@bob看看").
+  return new RegExp(AT_LEFT + '@' + esc + '(?![A-Za-z0-9_-])', 'iu').test(normalizeAt(content));
+}
+
+// Does the text @-mention ANYONE at all (any well-formed mention token)?
+export function hasMentionToken(content) {
+  return new RegExp(AT_LEFT + '@\\S', 'u').test(normalizeAt(content));
+}
+
+// The addressing INVARIANT: every posted turn reply must @ someone — an agent
+// message that mentions no one wakes no one (the #1 stall cause: a finished
+// speaker forgetting the handoff), and with broadcast self-judgment it is also
+// what caps a chain reaction (a broadcast may only ever produce ADDRESSED
+// replies, so a broadcast can never breed another broadcast). A reply that
+// already @s someone passes through untouched; one that doesn't is addressed
+// back at whoever triggered the turn.
+export function ensureAddressed(text, triggerSender, selfName) {
+  if (hasMentionToken(text)) return text;
+  return mentioning(triggerSender, text, selfName);
 }
 
 // …but an addressed failure note WAKES its addressee, and a peer that is failing
