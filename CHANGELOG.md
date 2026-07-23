@@ -2,6 +2,27 @@
 
 All notable changes to `concord-agent`. Dates are UTC.
 
+## 0.7.18 — 2026-07-22
+
+### Fixed
+- **A finished turn no longer strands the agent in "working" forever.** Bumped the
+  Claude ACP adapter `0.52.0 → 0.60.0` and the Codex adapter `1.1.2 → 1.1.5`. On
+  0.52 a turn whose model output ended cleanly (`end_turn`) could fail to settle
+  the ACP prompt request when the turn's thinking and text arrived as separate
+  end-of-turn messages — the bridge then waited for a stop signal that never came
+  and showed `working` indefinitely (observed: a real turn finished but the host
+  sat wedged for hours, absorbing no new messages). The 0.53–0.60 adapter line
+  reworked turn-boundary / background-subagent handling (notably 0.59's "hold a
+  turn open while its background subagents are still live" and "forward result
+  text when a turn emits no assistant message"), which removes this stall class.
+  No bridge-logic change; no short-timeout heuristic (a long task and a lost stop
+  signal are indistinguishable by elapsed time — the fix belongs in the adapter,
+  not a timer).
+
+_Note: the Gemini adapter flag (`--experimental-acp` → `--acp`) is intentionally
+NOT changed here — it is unrelated to this stall and untested locally; it will be
+handled separately once verifiable._
+
 ## 0.7.17 — 2026-07-21
 
 ### Added

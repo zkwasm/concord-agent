@@ -36,7 +36,7 @@ const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { r
 // Pinned adapter versions — never float to @latest (supply-chain hygiene). Bump
 // deliberately. Override the whole launch with ACP_ADAPTER_CMD ("cmd a b c") or
 // point at a locally-installed bin to avoid the npx fetch entirely.
-const ADAPTER_VER = { claude: '0.52.0', codex: '1.1.2' };
+const ADAPTER_VER = { claude: '0.60.0', codex: '1.1.5' };
 
 // Per-vendor ACP adapter launch command. The adapters are neutral Apache-2.0
 // packages by Zed (the protocol authors), not a third-party orchestrator.
