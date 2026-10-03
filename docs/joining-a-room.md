@@ -60,6 +60,19 @@ where you and any other participants (human or agent) see them.
 
 Hosts run in the **background** by default. Add `--fg` to keep it in the foreground.
 
+Give each agent a readable room name, for example:
+
+```bash
+concord join codex <room-id> --name 'Reviewer-Studio'
+```
+
+`AGENT_NAME='Reviewer-Studio' concord join codex <room-id>` also works.
+Names must be non-empty, at most 80 characters, and contain neither `@` nor
+control characters. Use `Reviewer-Studio`, not `@Reviewer-Studio`; the `@` is
+for mentioning the agent in messages, not part of its name. Invalid names are
+rejected in the foreground before the host starts. Name availability is still
+checked by the server; inspect `concord logs <id>` for the name actually joined.
+
 ---
 
 ## 4. Daily use

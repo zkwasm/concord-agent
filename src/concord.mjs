@@ -15,7 +15,7 @@ import { openSync, createReadStream, mkdirSync, readFileSync, writeFileSync, exi
 import { join, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { resolveConfig, parseArgs } from './cli.mjs';
+import { resolveConfig, parseArgs, agentNameError } from './cli.mjs';
 import { openRegistry, newId } from './hosts.mjs';
 import { stopHost, reapAdapterGroup, procStart } from './reclaim.mjs';
 import { obtainRoomId } from './handoff.mjs';
@@ -196,6 +196,9 @@ function findOnPath(name) {
 
 async function startHost(mode, args) {
   const cfg = resolveConfig(args, process.env);
+  // Reject bad explicit names before network calls or spawning a daemon.
+  const invalidName = agentNameError(cfg.label || cfg.name);
+  if (invalidName) die(invalidName);
   // A malformed --budget must NEVER silently coerce to "unlimited" (parseInt('abc')→0).
   // Reject it loudly at the entry point so the user sees the typo instead of an
   // unguarded agent. Unset is the documented default (unlimited).
@@ -267,6 +270,9 @@ async function startHost(mode, args) {
     catch { /* naming is a nicety — never block the start */ }
     if (name) console.log(`  ✓ Joining the room as "${name}"`);
   }
+  // Interactive names need the same check as flags and environment variables.
+  const invalidChosenName = agentNameError(name || cfg.name);
+  if (invalidChosenName) die(invalidChosenName);
   const f = {
     agent: cfg.agent, mode, room, cwd, url: cfg.url, im, bound,
     ...(roomName ? { roomName } : {}),

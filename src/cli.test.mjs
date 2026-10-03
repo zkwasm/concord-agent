@@ -1,7 +1,7 @@
 // Pure-logic tests for acp host CLI parsing. Run: node --test bridges/acp/cli.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseArgs, resolveConfig } from './cli.mjs';
+import { parseArgs, resolveConfig, agentNameError } from './cli.mjs';
 
 test('parseArgs: positionals and --flags with values', () => {
   const { flags, positional } = parseArgs(['claude', '--room', 'r1', '--cwd', '/tmp']);
@@ -184,4 +184,32 @@ test('classifyInbound fallback: boundary scan replaces raw includes()', async ()
   assert.equal(classifyInbound({ sender: 'x', senderType: 'agent', content: '@alice look' }, 'a'), 'defer');
   // fullwidth ＠ wakes on the fallback path too
   assert.equal(classifyInbound({ sender: 'x', senderType: 'agent', content: '＠评审 请看' }, '评审'), 'wake');
+});
+
+test('agent names: accept readable Unicode names, spaces, and the length boundary', () => {
+  for (const name of ['codex', 'TabDuoBao 代表', '审稿-Studio-01', 'a'.repeat(80)]) {
+    assert.equal(agentNameError(name), null, name);
+  }
+});
+
+test('agent names: reject missing values, @ prefixes, controls, and excessive length', () => {
+  for (const name of [undefined, null, true, '', '  ', '@reviewer', 'reviewer@studio',
+    'name\n', 'name\t', 'name\0', 'name\x7f', 'name\x85', 'a'.repeat(81)]) {
+    assert.ok(agentNameError(name), JSON.stringify(name));
+  }
+});
+
+test('agent names: validate resolved flag, label, and environment values', () => {
+  for (const [args, env] of [
+    [['codex', 'room', '--name', '@reviewer'], {}],
+    [['codex', 'room', '--as', '@reviewer'], {}],
+    [['codex', 'room'], { AGENT_NAME: '@reviewer' }],
+    [['codex', 'room', '--name'], {}],
+    [['codex', 'room', '--as'], {}],
+  ]) {
+    const cfg = resolveConfig(args, env);
+    assert.ok(agentNameError(cfg.label || cfg.name));
+  }
+  const cfg = resolveConfig(['codex', 'room', '--name', 'reviewer'], { AGENT_NAME: '@invalid' });
+  assert.equal(agentNameError(cfg.label || cfg.name), null);
 });

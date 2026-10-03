@@ -45,6 +45,17 @@ export function usage() {
   AGENT_TOKEN_BUDGET, AGENT_MODEL, AGENT_EFFORT, ACP_ADAPTER_CMD, ACP_PERMISSION.`;
 }
 
+// Validate the room-facing name before starting a host. Keep valid names intact.
+export function agentNameError(name) {
+  if (typeof name !== 'string' || !name.trim()) {
+    return 'Agent name must be a non-empty string. Supply a value for --name or --as.';
+  }
+  if (/[@\u0000-\u001f\u007f-\u009f]/u.test(name) || name.length > 80) {
+    return 'Invalid agent name: "@", control characters, and names longer than 80 chars are not allowed. Use the name without an @ prefix.';
+  }
+  return null;
+}
+
 // Resolve effective config. roomId / cwd default to null so the caller can decide
 // what "unset" means (room → web handoff; cwd → process.cwd()).
 export function resolveConfig(argv, env = {}) {
